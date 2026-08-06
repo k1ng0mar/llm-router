@@ -1,0 +1,20 @@
+# Runtime state — never commit these
+router.yaml
+router.db
+router.db-shm
+router.db-wal
+file:router.db?mode=ro
+
+# Build artifacts
+llm-router
+*.exe
+*.test
+*.out
+
+# Logs
+*.log
+logs/
+
+# Local dev
+.env
+.DS_Store

@@ -1,0 +1,2366 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover">
+<title>LLM Router</title>
+<meta name="theme-color" content="#004ac6">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="default">
+<meta name="apple-mobile-web-app-title" content="Router">
+<meta name="mobile-web-app-capable" content="yes">
+<link rel="apple-touch-icon" href="/icon-192.png">
+<link rel="apple-touch-icon" sizes="192x192" href="/icon-192.png">
+<link rel="apple-touch-icon" sizes="512x512" href="/icon-512.png">
+<link rel="icon" href="/icon-512.png">
+<link rel="manifest" href="data:application/json;base64,eyJuYW1lIjoiTExNIFJvdXRlciIsInNob3J0X25hbWUiOiJSb3V0ZXIiLCJzdGFydF91cmwiOiIvIiwiZGlzcGxheSI6InN0YW5kYWxvbmUiLCJiYWNrZ3JvdW5kX2NvbG9yIjoiI2ZmZmZmZiIsInRoZW1lX2NvbG9yIjoiIzAwNGFjNiIsImljb25zIjpbeyJzcmMiOiIvaWNvbi0xOTIucG5nIiwic2l6ZXMiOiIxOTJ4MTkyIiwidHlwZSI6ImltYWdlL3BuZyJ9LHsic3JjIjoiL2ljb24tNTEyLnBuZyIsInNpemVzIjoiNTEyeDUxMiIsInR5cGUiOiJpbWFnZS9wbmcifV19">
+<!-- Vendored assets (no CDN dependency; works fully offline / single-binary) -->
+<script src="/vendor/tailwind.js"></script>
+<link href="/vendor/fonts/fonts.css" rel="stylesheet">
+<link href="/vendor/fonts/material-symbols.css" rel="stylesheet">
+<script>
+tailwind.config = {
+  theme: {
+    extend: {
+      colors: {
+        "primary": "#004ac6", "primary-container": "#2563eb", "primary-fixed": "#dbe1ff",
+        "on-primary": "#ffffff", "on-primary-fixed": "#00174b", "on-primary-fixed-variant": "#003ea8",
+        "surface": "#fcf9f8", "surface-container-low": "#f6f3f2", "surface-container": "#f0eded",
+        "surface-container-high": "#eae7e7", "surface-container-lowest": "#ffffff",
+        "on-surface": "#1c1b1b", "on-surface-variant": "#434655",
+        "outline": "#737686", "outline-variant": "#c3c6d7",
+        "secondary": "#5e5e5c", "secondary-container": "#e1dfdc",
+        "error": "#ba1a1a", "error-container": "#ffdad6", "on-error-container": "#93000a",
+        "success": "#166534", "success-container": "#dcfce7",
+        "warning": "#b45309", "warning-container": "#fef3c7",
+        "trend-green": "#16a34a", "trend-red": "#dc2626", "trend-amber": "#d97706", "trend-gray": "#6b7280"
+      },
+      borderRadius: { DEFAULT: "0.125rem", lg: "0.25rem", xl: "0.5rem" },
+      fontFamily: {
+        sans: ["Hanken Grotesk", "sans-serif"], mono: ["JetBrains Mono", "monospace"]
+      },
+      fontSize: {
+        "label": ["12px", { "letterSpacing": "0.05em", "fontWeight": "700" }]
+      }
+    }
+  }
+}
+</script>
+<style>
+.material-symbols-outlined { font-variation-settings: 'FILL' 0, 'wght' 400, 'GRAD' 0, 'opsz' 24; }
+.icon-fill { font-variation-settings: 'FILL' 1; }
+.chart-bar-success { background-color: #004ac6; }
+.chart-bar-fallback { background-color: #d97706; }
+.chart-bar-failed { background-color: #dc2626; }
+body { background-color: #fcf9f8; color: #1c1b1b; font-family: 'Hanken Grotesk', sans-serif; }
+.route-badge { background: #fff; border: 1px solid #c3c6d7; border-radius: 2px; padding: 2px 6px; font-family: 'JetBrains Mono', monospace; font-size: 12px; color: #434655; display: inline-flex; align-items: center; gap: 3px; white-space: nowrap; }
+.route-badge.fail { border-color: #ba1a1a; color: #ba1a1a; text-decoration: line-through; }
+.route-badge.ok { border-color: #c3c6d7; color: #1c1b1b; }
+.route-badge.excl { border-color: #d97706; color: #d97706; opacity: 0.85; }
+.toggle-sw { position: relative; width: 36px; height: 20px; background: #c3c6d7; border-radius: 9999px; cursor: pointer; transition: background 0.2s; flex-shrink: 0; }
+.toggle-sw.on { background: #004ac6; }
+.toggle-sw::after { content: ''; position: absolute; top: 2px; left: 2px; width: 16px; height: 16px; background: #fff; border-radius: 50%; transition: transform 0.2s; }
+.toggle-sw.on::after { transform: translateX(16px); }
+.page { display: none; } .page.active { display: flex; }
+.detail-panel { opacity: 0; pointer-events: none; transition: opacity 0.2s; }
+.detail-panel.open { opacity: 1; pointer-events: auto; }
+table { border-collapse: collapse; }
+.pct-bar { height: 4px; background: #e5e2e1; border-radius: 2px; overflow: hidden; flex-grow: 1; }
+.pct-bar > div { height: 100%; background: #004ac6; border-radius: 2px; }
+</style>
+</head>
+<body class="min-h-screen flex flex-col pb-14 md:pb-0">
+
+<!-- Nav (desktop) -->
+<nav class="hidden md:flex justify-between items-center h-14 px-3 md:px-10 border-b border-outline-variant bg-surface">
+  <div class="flex items-center gap-3 md:gap-8 min-w-0">
+    <span class="font-bold text-base md:text-lg text-primary font-mono whitespace-nowrap">LLM Router</span>
+    <div class="flex gap-3 md:gap-6">
+      <a onclick="showPage('home')" class="nav-link cursor-pointer text-sm pb-1 whitespace-nowrap" data-page="home">Home</a>
+      <a onclick="showPage('requests')" class="nav-link cursor-pointer text-sm pb-1 whitespace-nowrap" data-page="requests">Requests</a>
+      <a onclick="showPage('providers')" class="nav-link cursor-pointer text-sm pb-1 whitespace-nowrap" data-page="providers">Providers</a>
+      <a onclick="showPage('config')" class="nav-link cursor-pointer text-sm pb-1 whitespace-nowrap" data-page="config">Config</a>
+      <a onclick="showPage('playground')" class="nav-link cursor-pointer text-sm pb-1 whitespace-nowrap" data-page="playground">Playground</a>
+    </div>
+  </div>
+</nav>
+
+<!-- Bottom Nav (mobile/PWA) -->
+<nav class="md:hidden fixed bottom-0 left-0 right-0 z-50 flex justify-around items-center h-14 border-t border-outline-variant bg-surface">
+  <a onclick="showPage('home')" class="nav-bot flex flex-col items-center justify-center gap-0.5 flex-1 h-full" data-page="home">
+    <span class="material-symbols-outlined" style="font-size:22px">dashboard</span>
+    <span class="text-[10px]">Home</span>
+  </a>
+  <a onclick="showPage('requests')" class="nav-bot flex flex-col items-center justify-center gap-0.5 flex-1 h-full" data-page="requests">
+    <span class="material-symbols-outlined" style="font-size:22px">list_alt</span>
+    <span class="text-[10px]">Requests</span>
+  </a>
+  <a onclick="showPage('providers')" class="nav-bot flex flex-col items-center justify-center gap-0.5 flex-1 h-full" data-page="providers">
+    <span class="material-symbols-outlined" style="font-size:22px">dns</span>
+    <span class="text-[10px]">Providers</span>
+  </a>
+  <a onclick="showPage('config')" class="nav-bot flex flex-col items-center justify-center gap-0.5 flex-1 h-full" data-page="config">
+    <span class="material-symbols-outlined" style="font-size:22px">settings</span>
+    <span class="text-[10px]">Config</span>
+  </a>
+  <a onclick="showPage('playground')" class="nav-bot flex flex-col items-center justify-center gap-0.5 flex-1 h-full" data-page="playground">
+    <span class="material-symbols-outlined" style="font-size:22px">science</span>
+    <span class="text-[10px]">Playground</span>
+  </a>
+</nav>
+
+<!-- HOME -->
+<div id="page-home" class="page active flex-col gap-6 px-4 md:px-10 py-6 max-w-7xl mx-auto w-full">
+  <div class="flex justify-between items-center">
+    <h1 class="text-2xl md:text-3xl font-semibold">Overview</h1>
+    <select id="home-range" onchange="loadStats()" class="border border-outline-variant bg-white rounded px-3 py-1.5 text-sm">
+      <option value="24h">Last 24 hours</option>
+      <option value="7d" selected>Last 7 days</option>
+      <option value="30d">Last 30 days</option>
+      <option value="all">All time</option>
+    </select>
+  </div>
+  <div id="home-stats" class="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-4"></div>
+  <div id="home-chart" class="border border-outline-variant rounded p-6 bg-surface-container-low flex flex-col gap-4"></div>
+  <div class="flex justify-between items-center">
+    <h2 class="text-xl font-semibold">Recent Requests</h2>
+    <a onclick="showPage('requests')" class="text-sm text-primary hover:underline cursor-pointer">View all →</a>
+  </div>
+  <div id="home-requests" class="border border-outline-variant rounded bg-surface-container-lowest overflow-x-auto"></div>
+  <div class="flex justify-between items-center"><h2 class="text-xl font-semibold">Model Usage</h2></div>
+  <div id="home-model-usage" class="border border-outline-variant rounded bg-surface-container-lowest overflow-x-auto"></div>
+</div>
+
+<!-- REQUESTS -->
+<div id="page-requests" class="page flex-col gap-4 px-4 md:px-10 py-6 max-w-7xl mx-auto w-full">
+  <div><h1 class="text-2xl md:text-3xl font-semibold">Requests</h1><p id="req-count" class="text-sm text-on-surface-variant mt-1">--</p></div>
+  <div class="flex flex-wrap gap-3 items-center bg-surface-container-low p-3 border border-outline-variant rounded">
+    <input id="req-search" oninput="reqPage=0;renderRequests()" placeholder="Search ID or provider…" class="border border-outline-variant bg-white rounded px-3 py-2 text-sm flex-1 min-w-[200px]">
+    <select id="req-status" onchange="reqPage=0;renderRequests()" class="border border-outline-variant bg-white rounded px-2 py-2 text-sm"><option value="">All statuses</option><option value="success">Success</option><option value="failed">Failed</option></select>
+    <select id="req-pool" onchange="reqPage=0;renderRequests()" class="border border-outline-variant bg-white rounded px-2 py-2 text-sm"><option value="">All pools</option></select>
+    <select id="req-provider" onchange="reqPage=0;renderRequests()" class="border border-outline-variant bg-white rounded px-2 py-2 text-sm"><option value="">All providers</option></select>
+  </div>
+  <div id="req-table" class="border border-outline-variant rounded bg-surface-container-lowest overflow-x-auto"></div>
+</div>
+
+<!-- PROVIDERS -->
+<div id="page-providers" class="page flex-col gap-6 px-4 md:px-10 py-6 max-w-7xl mx-auto w-full">
+  <div class="flex justify-between items-center">
+    <div><h1 class="text-2xl md:text-3xl font-semibold">Providers</h1><p id="prov-subtitle" class="text-sm text-on-surface-variant mt-1">--</p></div>
+    <button onclick="showPage('add-provider')" class="bg-primary text-on-primary text-sm px-4 py-2 rounded hover:opacity-90">Add Provider</button>
+  </div>
+  <div id="prov-list" class="flex flex-col gap-3"></div>
+</div>
+
+<!-- ADD PROVIDER -->
+<div id="page-add-provider" class="page flex-col gap-6 px-4 md:px-10 py-6 max-w-2xl mx-auto w-full">
+  <div class="flex items-center gap-3">
+    <button onclick="showPage('providers')" class="p-2 hover:bg-surface-container rounded"><span class="material-symbols-outlined">arrow_back</span></button>
+    <h1 class="text-2xl md:text-3xl font-semibold">Add Provider</h1>
+  </div>
+  <p class="text-sm text-on-surface-variant">Custom providers default to the OpenAI-compatible <code class="font-mono text-xs bg-surface-container px-1 rounded">/v1/chat/completions</code> convention. Pick <code class="font-mono text-xs bg-surface-container px-1 rounded">Anthropic</code> or <code class="font-mono text-xs bg-surface-container px-1 rounded">Gemini</code> to talk to those native APIs directly.</p>
+  <div class="border border-outline-variant rounded p-6 bg-surface-container-low flex flex-col gap-3">
+    <label class="text-sm flex flex-col gap-1">Name<span class="text-xs text-on-surface-variant">how the provider appears in pools/chains</span><input id="new-prov-name" placeholder="e.g. my-provider" class="border border-outline-variant bg-white rounded px-3 py-2 text-sm"></label>
+    <label class="text-sm flex flex-col gap-1">Base URL<span class="text-xs text-on-surface-variant">OpenAI: the router appends /v1/chat/completions. Anthropic/Gemini: use the API root (e.g. https://api.anthropic.com)</span><input id="new-prov-url" placeholder="https://api.example.com/v1" class="border border-outline-variant bg-white rounded px-3 py-2 text-sm font-mono"></label>
+    <label class="text-sm flex flex-col gap-1">API Mode<span class="text-xs text-on-surface-variant">wire format the upstream speaks</span><select id="new-prov-mode" class="border border-outline-variant bg-white rounded px-3 py-2 text-sm">
+      <option value="openai">OpenAI-compatible</option>
+      <option value="anthropic">Anthropic (/v1/messages)</option>
+      <option value="gemini">Gemini (generateContent)</option>
+    </select></label>
+    <label class="text-sm flex flex-col gap-1">API Keys<span class="text-xs text-on-surface-variant">one per line — optional for keyless/local providers</span><textarea id="new-prov-keys" placeholder="sk-..." class="border border-outline-variant bg-white rounded px-3 py-2 text-sm font-mono" rows="3"></textarea></label>
+    <div class="flex gap-3 mt-2">
+      <button onclick="addProvider()" class="bg-primary text-on-primary text-sm px-4 py-2 rounded hover:opacity-90">Add Provider</button>
+      <button onclick="showPage('providers')" class="border border-outline-variant text-sm px-4 py-2 rounded hover:bg-surface-container">Cancel</button>
+    </div>
+  </div>
+</div>
+
+
+<!-- CONFIG -->
+<div id="page-config" class="page flex-col gap-6 px-4 md:px-10 py-6 max-w-7xl mx-auto w-full">
+  <h1 class="text-2xl md:text-3xl font-semibold">Config</h1>
+  <div class="border border-outline-variant rounded p-6 bg-surface-container-low flex flex-col gap-4">
+    <h2 class="font-semibold">Default Pool</h2>
+    <div class="flex gap-3 items-center">
+      <select id="cfg-default" class="border border-outline-variant bg-white rounded px-3 py-2 text-sm"></select>
+      <button onclick="saveDefault()" class="bg-primary text-on-primary text-sm px-4 py-2 rounded hover:opacity-90">Save</button>
+    </div>
+  </div>
+  <div class="border border-outline-variant rounded p-6 bg-surface-container-low flex flex-col gap-4">
+    <h2 class="font-semibold">Pools</h2>
+    <p class="text-sm text-on-surface-variant">Select provider+model pairs. First entry is primary.</p>
+    <div id="cfg-pools" class="flex flex-col gap-4"></div>
+  </div>
+  <div class="border border-outline-variant rounded p-6 bg-surface-container-low flex flex-col gap-4">
+    <h2 class="font-semibold">Chains</h2>
+    <p class="text-sm text-on-surface-variant">Use <code class="font-mono text-xs bg-surface-container px-1 rounded">chain:name</code> as the model in your client.</p>
+    <div id="cfg-chains" class="flex flex-col gap-4"></div>
+  </div>
+</div>
+
+<!-- PLAYGROUND -->
+<div id="page-playground" class="page flex-col gap-6 px-4 md:px-10 py-6 max-w-7xl mx-auto w-full">
+  <div>
+    <h1 class="text-2xl md:text-3xl font-semibold">Playground</h1>
+    <p class="text-sm text-on-surface-variant mt-1">Test models side-by-side and compare tokens and latency.</p>
+  </div>
+
+  <!-- Prompt input -->
+  <div class="border border-outline-variant rounded bg-surface-container-lowest flex flex-col gap-3 p-4">
+    <label class="text-xs font-bold uppercase tracking-wide text-on-surface-variant">Prompt</label>
+    <textarea id="pg-prompt" rows="4" placeholder="Type a prompt to send to every selected model..." class="border border-outline-variant bg-white rounded px-3 py-2 text-sm w-full"></textarea>
+    <div class="flex flex-wrap gap-3 items-center">
+      <label class="text-sm flex items-center gap-2">
+        <span class="text-on-surface-variant whitespace-nowrap">Max tokens</span>
+        <input id="pg-max-tokens" type="number" value="100" min="1" max="8192" class="border border-outline-variant bg-white rounded px-2 py-1.5 text-sm w-24">
+      </label>
+      <div class="flex-1"></div>
+      <button onclick="addPgRow()" class="border border-outline-variant bg-white text-sm px-3 py-2 rounded hover:bg-surface-container flex items-center gap-1">
+        <span class="material-symbols-outlined text-base">add</span>Add Model
+      </button>
+      <button id="pg-run-btn" onclick="runPlayground()" class="bg-primary text-on-primary text-sm px-4 py-2 rounded hover:opacity-90 flex items-center gap-2">
+        <span class="material-symbols-outlined text-base">play_arrow</span>Run All
+      </button>
+    </div>
+  </div>
+
+  <!-- Model selector rows -->
+  <div class="flex flex-col gap-3">
+    <div id="pg-rows" class="flex flex-col gap-2"></div>
+    <div id="pg-rows-empty" class="text-sm text-on-surface-variant border border-dashed border-outline-variant rounded p-6 text-center">
+      No models added yet. Click Add Model to pick a provider and model to test.
+    </div>
+  </div>
+
+  <!-- Results -->
+  <div>
+    <h2 class="text-xl font-semibold mb-3">Results</h2>
+    <div id="pg-results" class="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4"></div>
+    <div id="pg-results-empty" class="text-sm text-on-surface-variant border border-dashed border-outline-variant rounded p-6 text-center">
+      Run a prompt to see results from each model.
+    </div>
+  </div>
+</div>
+
+<!-- Request Detail Panel (full-page overlay) -->
+<div id="detail-panel" class="detail-panel fixed inset-0 bg-surface z-50 flex flex-col">
+  <div class="flex items-center justify-between p-4 border-b border-outline-variant bg-surface-container-low">
+    <div><h2 class="font-semibold text-lg">Request Detail</h2><span id="detail-id" class="font-mono text-sm text-on-surface-variant"></span></div>
+    <button onclick="closeDetail()" class="p-2 hover:bg-surface-container rounded"><span class="material-symbols-outlined">close</span></button>
+  </div>
+  <div id="detail-body" class="flex-1 overflow-y-auto p-4 md:px-10 py-6 max-w-7xl mx-auto w-full flex flex-col gap-4"></div>
+  <div class="p-4 border-t border-outline-variant bg-surface-container-low flex gap-3 max-w-7xl mx-auto w-full">
+    <button onclick="rerunRequest()" class="bg-primary text-on-primary text-sm px-4 py-2 rounded flex-1">Re-run</button>
+    <button onclick="copyRequestId()" class="border border-outline-variant text-sm px-4 py-2 rounded flex-1">Copy ID</button>
+  </div>
+</div>
+
+<!-- Provider Detail Panel (full-page overlay) -->
+<div id="prov-detail-panel" class="detail-panel fixed inset-0 bg-surface z-50 flex flex-col">
+  <div class="flex items-center justify-between p-4 border-b border-outline-variant bg-surface-container-low">
+    <div><h2 class="font-semibold text-lg">Provider Details</h2><span id="prov-detail-name" class="font-mono text-sm text-on-surface-variant"></span></div>
+    <button onclick="closeProvDetail()" class="p-2 hover:bg-surface-container rounded"><span class="material-symbols-outlined">close</span></button>
+  </div>
+  <div id="prov-detail-body" class="flex-1 overflow-y-auto p-4 md:px-10 py-6 max-w-7xl mx-auto w-full flex flex-col gap-4"></div>
+  <div id="prov-detail-footer" class="p-4 border-t border-outline-variant bg-surface-container-low flex gap-3 max-w-7xl mx-auto w-full">
+    <button onclick="testProviderConn()" class="border border-outline-variant text-sm px-4 py-2 rounded flex-1 flex items-center justify-center gap-2"><span class="material-symbols-outlined text-base">cable</span>Test Connection</button>
+    <button onclick="closeProvDetail()" class="border border-outline-variant text-sm px-4 py-2 rounded flex-1">Discard</button>
+    <button onclick="saveProvDetail()" class="bg-primary text-on-primary text-sm px-4 py-2 rounded flex-1">Save Changes</button>
+  </div>
+</div>
+
+<!-- Config Selector Modal (like Hermes SET MAIN MODEL) -->
+<div id="cfg-selector-modal" class="fixed inset-0 z-50 hidden">
+  <div class="absolute inset-0 bg-black/50 backdrop-blur-sm" onclick="closeCfgModal()"></div>
+  <div class="absolute inset-4 md:inset-8 bg-surface rounded-xl border border-outline-variant flex flex-col overflow-hidden">
+    <div class="p-4 border-b border-outline-variant bg-surface-container-low flex items-center gap-3">
+      <h2 class="font-semibold text-lg" id="cfg-modal-title">Select Model</h2>
+      <button onclick="closeCfgModal()" class="ml-auto p-2 hover:bg-surface-container rounded"><span class="material-symbols-outlined">close</span></button>
+    </div>
+    <div class="p-3 border-b border-outline-variant">
+      <div class="flex items-center gap-2">
+        <span class="material-symbols-outlined text-on-surface-variant">search</span>
+        <input id="cfg-modal-search" type="text" placeholder="Search providers..." class="flex-1 border border-outline-variant bg-white rounded-lg px-3 py-2 text-sm" oninput="filterCfgModal()">
+      </div>
+      <div class="flex items-center gap-1 mt-2 bg-surface-container rounded-lg p-1 w-fit">
+        <button data-mode="provider" onclick="setCfgSearchMode('provider')" class="text-sm px-3 py-1 rounded-md cfg-search-mode cfg-search-mode-active">Search Provider</button>
+        <button data-mode="model" onclick="setCfgSearchMode('model')" class="text-sm px-3 py-1 rounded-md cfg-search-mode">Search Model</button>
+      </div>
+    </div>
+    <div class="flex-1 flex overflow-hidden">
+      <!-- Left: Providers -->
+      <div class="w-1/3 border-r border-outline-variant overflow-y-auto">
+        <div id="cfg-modal-providers" class="py-2"></div>
+      </div>
+      <!-- Right: Models -->
+      <div class="flex-1 overflow-y-auto">
+        <div id="cfg-modal-models" class="py-2"></div>
+      </div>
+    </div>
+    <div class="p-4 border-t border-outline-variant bg-surface-container-low flex items-center justify-between">
+      <div class="text-sm text-on-surface-variant" id="cfg-modal-status">Select a provider and model</div>
+      <div class="flex gap-3">
+        <button onclick="closeCfgModal()" class="border border-outline-variant text-sm px-4 py-2 rounded">Cancel</button>
+        <button onclick="confirmCfgModal()" class="bg-primary text-on-primary text-sm px-4 py-2 rounded">Switch</button>
+      </div>
+    </div>
+  </div>
+</div>
+
+<script>
+let currentConfig = {}, allRequests = [], allStats = null, allModels = [];
+let providerModels = {};
+// Per-row state for config selector rows. Rows are identified by a STABLE
+// unique id (rowModels[rowId]) rather than by array index, so adding/removing
+// rows or drag-reordering can never make one row read another row's fetched
+// models or loading flag. rowFetchToken guards against out-of-order responses:
+// if two fetches for the same row race, only the latest wins.
+let rowModels = {};        // rowId -> {provider, models[]}
+let rowFetchToken = {};    // rowId -> incrementing token
+let rowSeq = 0;            // rowId allocator
+function newRowId() { return 'r' + (++rowSeq); }
+let currentRange = '7d', currentDetail = null, currentProvDetail = null;
+
+// --- helpers ---
+function esc(s) { return String(s||'').replace(/[&<>"']/g, c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c])); }
+async function api(url, opts={}) {
+  try {
+    const r = await fetch(url, {headers: {'Content-Type': 'application/json', 'Authorization': 'Bearer ' + (window.ROUTER_KEY || 'change-me'), ...opts.headers}, ...opts});
+    let data; try { data = await r.json(); } catch { data = null; }
+    return {ok: r.ok, status: r.status, data};
+  } catch(e) {
+    // Normalize the failure shape so every caller sees {ok:false, data:{error:{message}}}.
+    // Previously `data` was the raw error string here, which broke callers doing r.data?.error.
+    return {ok: false, status: 0, data: {error: {message: e.message || 'network error'}}};
+  }
+}
+function fmtNum(n) { n = n||0; return n >= 1e6 ? (n/1e6).toFixed(1)+'M' : n >= 1e3 ? (n/1e3).toFixed(1)+'k' : String(n); }
+function fmtCost(c) { c = c||0; return c === 0 ? '$0.00' : c < 0.01 ? '<$0.01' : '$'+c.toFixed(2); }
+function fmtMs(ms) { ms = ms||0; return ms >= 1000 ? (ms/1000).toFixed(2)+'s' : ms+'ms'; }
+function tryFormatJSON(s) { try { return JSON.stringify(JSON.parse(s), null, 2); } catch(e) { return s; } }
+function renderBody(body, label) {
+  if (!body) return '<p class="text-sm text-on-surface-variant">Not captured</p>';
+  const formatted = tryFormatJSON(body);
+  const id = 'body-' + label + '-' + Math.random().toString(36).slice(2,8);
+  return `<div class="relative">
+    <pre id="${id}" class="font-mono text-xs bg-surface-container-lowest border border-outline-variant rounded p-3 overflow-x-auto overflow-y-auto" style="max-height:200px;white-space:pre-wrap;word-break:break-all">${esc(formatted)}</pre>
+    <button onclick="toggleBodyExpand('${id}', this)" class="text-xs text-primary hover:underline mt-1">Show more</button>
+  </div>`;
+}
+function toggleBodyExpand(id, btn) {
+  const el = document.getElementById(id);
+  if (el.style.maxHeight === '200px' || !el.style.maxHeight) {
+    el.style.maxHeight = 'none';
+    btn.textContent = 'Show less';
+  } else {
+    el.style.maxHeight = '200px';
+    btn.textContent = 'Show more';
+  }
+}
+function avatarColor(name) {
+  const colors = ['#004ac6','#943700','#166534','#7e22ce','#b45309','#0e7490','#be185d','#4338ca'];
+  let h = 0; for (let i=0;i<name.length;i++) h = ((h<<5)-h)+name.charCodeAt(i);
+  return colors[Math.abs(h) % colors.length];
+}
+// icon set for known providers and common models
+const PROVIDER_ICONS = {
+  'agnes':'psychology', 'openai':'smart_toy', 'openrouter':'hub', 'anthropic':'psychology',
+  'charm':'charm', 'xkiro':'star', 'cerebras':'bolt', 'grok':'psychology', 'groq':'flash_on',
+  'gemini':'face', 'google':'google', 'ollama':'memory', 'nvidia':'nvidia', 'mistral':'visibility',
+  'cohere':'psychology', 'fireworks':'flare', 'makora':'shield', 'zai':'volume_up',
+  'deepseek':'search', 'deepseek-v4-flash':'search',
+};
+function iconFor(name) {
+  name = (name||'').toLowerCase();
+  return PROVIDER_ICONS[name] || 'dns';
+}
+function baseUrlForProvider(name) {
+  const p = currentConfig.providers?.[name];
+  return p?.base_url || '';
+}
+// provider logos -- served from embedded /logos/{name}.png
+function avatar(name, baseUrl) {
+  const c = avatarColor(name);
+  const icon = iconFor(name);
+  const logoUrl = `/logos/${encodeURIComponent(name)}.png`;
+  // img with logo on colored bg; if logo 404s, onerror hides img and shows icon
+  return `<div class="w-6 h-6 rounded flex items-center justify-center text-white overflow-hidden" style="background:${c}"><img src="${logoUrl}" alt="${esc(name)}" class="w-5 h-5 rounded object-contain" loading="lazy" onerror="this.style.display='none';this.nextElementSibling.style.display=''"><span class="material-symbols-outlined text-[10px]" style="display:none">${icon}</span></div>`;
+}
+function poolChip(pool) { const colors = {chat:'#dbe1ff',code:'#dcfce7',creative:'#f3e8ff',reasoning:'#fef3c7',vision:'#dbe1ff'}; const bg = colors[pool]||'#e5e2e1'; return `<span class="text-xs font-mono px-1.5 py-0.5 rounded" style="background:${bg}">${esc(pool||'')}</span>`; }
+function statusIcon(status) {
+  if (status >= 200 && status < 300) return '<span class="material-symbols-outlined text-trend-green" style="font-size:18px">check_circle</span>';
+  if (status >= 400) return '<span class="material-symbols-outlined text-trend-red" style="font-size:18px">error</span>';
+  return '<span class="material-symbols-outlined text-trend-gray" style="font-size:18px">help</span>';
+}
+function statusLabel(status) {
+  if (status >= 200 && status < 300) return '<span class="text-xs font-mono px-2 py-0.5 rounded bg-success-container text-success">SUCCESS</span>';
+  if (status >= 400) return '<span class="text-xs font-mono px-2 py-0.5 rounded bg-error-container text-error">FAILED</span>';
+  return '<span class="text-xs font-mono px-2 py-0.5 rounded bg-surface-container-high text-on-surface-variant">--</span>';
+}
+function renderTrail(req) {
+  const atts = req.attempts || []; if (!atts.length) return '<span class="text-sm text-on-surface-variant">--</span>';
+  let parts = [];
+  for (let i=0; i<atts.length; i++) {
+    const a = atts[i];
+    const excluded = a.status === 0 && (a.err||'').startsWith('excluded');
+    const fail = !excluded && (a.status >= 400 || a.status === 0);
+    if (i > 0) parts.push('<span class="material-symbols-outlined text-outline" style="font-size:14px">arrow_right_alt</span>');
+    let icon, cls;
+    if (excluded) { icon = '<span class="material-symbols-outlined text-trend-amber" style="font-size:12px">block</span>'; cls = 'excl'; }
+    else if (fail) { icon = '<span class="material-symbols-outlined text-trend-red" style="font-size:12px">close</span>'; cls = 'fail'; }
+    else { icon = '<span class="material-symbols-outlined text-trend-green" style="font-size:12px">check</span>'; cls = 'ok'; }
+    parts.push(`<span class="route-badge ${cls}">${esc(a.provider)}:${esc(a.model)} ${icon}</span>`);
+    const chip = (!excluded && fail) || excluded ? failChip(a) : '';
+    if (chip) parts.push(chip);
+  }
+  return `<div class="flex items-center gap-1 flex-wrap">${parts.join('')}</div>`;
+}
+
+// Delegated click dispatcher: instead of building `onclick="fn('${esc(x)}')"`
+// attributes (where a quote-bearing config value could break out of the JS
+// string after HTML-entity decoding), we emit `data-action="fn" data-name="x"`
+// attributes — esc() makes attribute values safe — and dispatch here. The
+// element that has the action may be the click target or an ancestor; we walk
+// up to find it.
+document.addEventListener('click', function(e) {
+  const el = e.target.closest('[data-action]');
+  if (!el) return;
+  const a = el.dataset.action;
+  const name = el.dataset.name;
+  const container = el.dataset.container;
+  const groupType = el.dataset.type;
+  switch (a) {
+    case 'selectCfgModalProvider': if (name) selectCfgModalProvider(name); break;
+    case 'selectCfgModalModel': if (name) selectCfgModalModel(name, el); break;
+    case 'toggleProvider': {
+      if (!name) break;
+      const enabled = el.dataset.enabled === 'true';
+      toggleProvider(name, enabled);
+      break;
+    }
+    case 'openProvDetail': if (name) openProvDetail(name); break;
+    case 'deleteProvider': if (name) deleteProvider(name); break;
+    case 'toggleModelDisabled': if (name) toggleModelDisabled(name, el); break;
+    case 'saveGroup': if (container && name && groupType) saveGroup(container, name, groupType); break;
+    case 'removeRow': if (container && name) removeRow(container, name); break;
+    case 'openCfgModalForAdd': if (container && name && groupType) openCfgModalForAdd(container, name, groupType); break;
+    case 'createGroup': if (container && groupType) createGroup(container, groupType); break;
+    case 'openDetail': if (name) openDetail(name); break;
+    case 'toggleCfgEditMode': if (container) toggleCfgEditMode(container); break;
+  }
+});
+
+// --- nav ---
+function showPage(name) {
+  document.querySelectorAll('.page').forEach(p => p.classList.remove('active'));
+  document.getElementById('page-'+name).classList.add('active');
+  // desktop nav
+  document.querySelectorAll('.nav-link').forEach(l => { l.classList.remove('text-primary','border-b-2','border-primary'); l.classList.add('text-on-surface-variant'); });
+  const link = document.querySelector(`.nav-link[data-page="${name}"]`);
+  if (link) { link.classList.add('text-primary','border-b-2','border-primary'); link.classList.remove('text-on-surface-variant'); }
+  // bottom nav
+  document.querySelectorAll('.nav-bot').forEach(l => { l.classList.remove('text-primary'); l.classList.add('text-on-surface-variant'); });
+  const botLink = document.querySelector(`.nav-bot[data-page="${name}"]`);
+  if (botLink) { botLink.classList.add('text-primary'); botLink.classList.remove('text-on-surface-variant'); }
+  if (name === 'requests') renderRequests();
+  if (name === 'providers') renderProviders();
+  if (name === 'config') renderConfig();
+  if (name === 'playground') initPlayground();
+}
+
+// --- stats ---
+async function loadStats() {
+  currentRange = document.getElementById('home-range')?.value || '7d';
+  const r = await api('/api/stats?range='+currentRange);
+  if (!r.ok || !r.data) {
+    renderStats(null);
+    const msg = r.data?.error?.message || ('HTTP ' + r.status);
+    if (r.status === 0) showConfigToast('Stats: ' + msg, true); // network/server error, not just empty
+    return;
+  }
+  allStats = r.data; renderStats(allStats);
+  // also load model usage
+  const r2 = await api('/api/usage/models?range='+currentRange);
+  if (r2.ok && r2.data) { allModels = r2.data; renderModelUsage(allModels); } else { renderModelUsage([]); }
+}
+function renderStats(st) {
+  const el = document.getElementById('home-stats');
+  if (!st) { el.innerHTML = '<div class="text-sm text-on-surface-variant col-span-4">No data yet.</div>'; return; }
+  const sr = st.success_rate ? st.success_rate.toFixed(1)+'%' : '--';
+  el.innerHTML = `
+    <div class="border border-outline-variant rounded p-4 bg-surface-container-lowest flex flex-col gap-1">
+      <span class="text-xs font-bold uppercase tracking-wide text-on-surface-variant">Total Requests</span>
+      <span class="text-2xl font-mono font-medium">${fmtNum(st.total)}</span>
+    </div>
+    <div class="border border-outline-variant rounded p-4 bg-surface-container-lowest flex flex-col gap-1">
+      <span class="text-xs font-bold uppercase tracking-wide text-on-surface-variant">Success Rate</span>
+      <span class="text-2xl font-mono font-medium ${st.success_rate>=90?'text-trend-green':st.success_rate>=50?'text-trend-amber':'text-trend-red'}">${sr}</span>
+    </div>
+    <div class="border border-primary-fixed rounded p-4 bg-primary-fixed flex flex-col gap-1">
+      <span class="text-xs font-bold uppercase tracking-wide text-on-primary-fixed-variant">Recovered by Fallback</span>
+      <span class="text-2xl font-mono font-medium text-on-primary-fixed">${st.recovered||0}</span>
+    </div>
+    <div class="border border-outline-variant rounded p-4 bg-surface-container-lowest flex flex-col gap-1">
+      <span class="text-xs font-bold uppercase tracking-wide text-on-surface-variant">Failed</span>
+      <span class="text-2xl font-mono font-medium ${st.failed>0?'text-trend-red':'text-on-surface'}">${st.failed||0}</span>
+    </div>`;
+  // chart
+  const chartEl = document.getElementById('home-chart');
+  const daily = st.daily || [];
+  if (!daily.length) { chartEl.innerHTML = '<span class="text-xs font-bold uppercase tracking-wide text-on-surface-variant">Requests</span><div class="h-48 flex items-center justify-center text-sm text-on-surface-variant">No data in this range.</div>'; return; }
+  const maxVal = Math.max(...daily.map(d => (d.success||0)+(d.recovered||0)+(d.failed||0)), 1);
+  let bars = daily.map(d => {
+    const sH = ((d.success||0)/maxVal)*100, fH = ((d.recovered||0)/maxVal)*100, dH = ((d.failed||0)/maxVal)*100;
+    const day = d.date ? d.date.slice(5) : '';
+    return `<div class="flex flex-col justify-end items-center flex-1 gap-0.5 h-full" title="${(d.success||0)} success · ${(d.recovered||0)} recovered · ${(d.failed||0)} failed">
+      <div class="w-full flex flex-col justify-end h-full">
+        <div class="w-full chart-bar-failed rounded-t" style="height:${dH}%"></div>
+        <div class="w-full chart-bar-fallback" style="height:${fH}%"></div>
+        <div class="w-full chart-bar-success" style="height:${sH}%"></div>
+      </div>
+      <span class="text-xs font-mono text-on-surface-variant">${day}</span>
+    </div>`;
+  }).join('');
+  chartEl.innerHTML = `
+    <span class="text-xs font-bold uppercase tracking-wide text-on-surface-variant">Requests</span>
+    <div class="h-48 w-full flex items-end gap-1 border-b border-outline-variant">${bars}</div>
+    <div class="flex gap-4 pt-2">
+      <div class="flex items-center gap-2 text-sm"><div class="w-3 h-3 chart-bar-success rounded-sm"></div> Success</div>
+      <div class="flex items-center gap-2 text-sm"><div class="w-3 h-3 chart-bar-fallback rounded-sm"></div> Recovered</div>
+      <div class="flex items-center gap-2 text-sm"><div class="w-3 h-3 chart-bar-failed rounded-sm"></div> Failed</div>
+    </div>`;
+}
+
+// --- requests ---
+let reqPage = 0, reqLimit = 50, reqTotal = 0, reqLoaded = 0;
+const REQ_BATCH = 300; // per-fetch batch size (server caps at 500)
+async function loadRequests() {
+  const r = await api('/api/requests?limit='+REQ_BATCH+'&offset=0');
+  if (!r.ok || !r.data || !r.data.data) {
+    allRequests = []; reqLoaded = 0; reqTotal = 0;
+    // distinguish a network/server error from a genuinely empty log
+    const msg = r.data?.error?.message || ('HTTP ' + r.status);
+    showConfigToast('Failed to load requests: ' + msg, true);
+    document.getElementById('req-count').textContent = '—';
+    return;
+  }
+  allRequests = r.data.data;
+  reqLoaded = allRequests.length;
+  reqTotal = r.data.total;
+  document.getElementById('req-count').textContent = `${reqTotal} requests`;
+  renderHomeRequests();
+  populateFilters();
+  renderRequests();
+}
+// Lazy-load older requests when paging beyond the currently-loaded window.
+// Previously the page hard-coded limit=500&offset=0, so requests beyond the
+// first 500 were unreachable. Now Next fetches the next batch on demand.
+async function ensureRequestsLoaded(neededCount) {
+  while (allRequests.length < neededCount && allRequests.length < reqTotal) {
+    const r = await api('/api/requests?limit='+REQ_BATCH+'&offset='+allRequests.length);
+    if (!r.ok || !r.data || !r.data.data) { showConfigToast('Failed to load more requests', true); break; }
+    const batch = r.data.data;
+    if (!batch.length) break;
+    // de-dupe by id (defensive against overlap)
+    const have = new Set(allRequests.map(x => x.id));
+    for (const x of batch) if (!have.has(x.id)) allRequests.push(x);
+    if (batch.length < REQ_BATCH) break; // exhausted
+  }
+}
+function prevPage() { if (reqPage > 0) reqPage--; renderRequests(); }
+async function nextPage() {
+  // if the next page would extend past what we've loaded, fetch more first
+  const need = (reqPage + 1) * reqLimit + reqLimit;
+  if (need > allRequests.length && allRequests.length < reqTotal) {
+    await ensureRequestsLoaded(need);
+  }
+  reqPage++;
+  renderRequests();
+}
+function setReqLimit(v) { reqLimit = parseInt(v); reqPage = 0; renderRequests(); }
+// Non-destructive refresh: pull the newest batch and merge any new request ids
+// in at the top, preserving the current page position, filters, and open detail
+// panel. Used by the auto-refresh poller so the user isn't bounced around.
+async function refreshRequestsTop() {
+  const r = await api('/api/requests?limit='+REQ_BATCH+'&offset=0');
+  if (!r.ok || !r.data || !r.data.data) return;
+  const fresh = r.data.data;
+  reqTotal = r.data.total;
+  document.getElementById('req-count').textContent = `${reqTotal} requests`;
+  const have = new Set(allRequests.map(x => x.id));
+  let added = 0;
+  for (const x of fresh) { if (!have.has(x.id)) { allRequests.unshift(x); added++; } }
+  // update in-place copies of rows that already exist (status may have changed)
+  const byId = new Map(fresh.map(x => [x.id, x]));
+  for (let i = 0; i < allRequests.length; i++) {
+    if (byId.has(allRequests[i].id)) allRequests[i] = byId.get(allRequests[i].id);
+  }
+  if (added > 0) populateFilters();
+  const active = document.querySelector('.page.active')?.id;
+  if (active === 'page-home') renderHomeRequests();
+  if (active === 'page-requests') renderRequests();
+  // if a request detail is open, refresh its in-memory copy so the trail updates
+  if (currentDetail && byId.has(currentDetail.id)) {
+    currentDetail = byId.get(currentDetail.id);
+    if (document.getElementById('detail-panel').classList.contains('open')) openDetail(currentDetail.id);
+  }
+}
+function renderHomeRequests() {
+  const el = document.getElementById('home-requests');
+  const reqs = allRequests.slice(0, 5);
+  if (!reqs.length) { el.innerHTML = '<div class="p-6 text-sm text-on-surface-variant">No requests yet.</div>'; return; }
+  el.innerHTML = `<table class="w-full text-left min-w-[600px]">
+    <thead><tr class="border-b border-outline-variant text-xs uppercase text-on-surface-variant font-bold">
+      <th class="py-2 px-3">Status</th><th class="py-2 px-3">Time</th><th class="py-2 px-3">Route Trail</th><th class="py-2 px-3">Pool</th><th class="py-2 px-3 text-right">Attempts</th>
+    </tr></thead><tbody class="font-mono text-sm">
+    ${reqs.map(r => `<tr class="border-b border-outline-variant hover:bg-surface-container cursor-pointer" data-action="openDetail" data-name="${esc(r.id)}">
+      <td class="py-3 px-3">${statusIcon(r.final_status)}</td>
+      <td class="py-3 px-3 text-on-surface-variant text-xs">${esc(r.ts)}</td>
+      <td class="py-3 px-3">${renderTrail(r)}</td>
+      <td class="py-3 px-3">${poolChip(r.pool)}</td>
+      <td class="py-3 px-3 text-right text-on-surface-variant">${(r.attempts||[]).length}</td>
+    </tr>`).join('')}
+    </tbody></table>`;
+}
+function populateFilters() {
+  const pools = [...new Set(allRequests.map(r=>r.pool).filter(Boolean))];
+  const provs = [...new Set(allRequests.map(r=>r.final_provider).filter(Boolean))];
+  const poolSel = document.getElementById('req-pool');
+  poolSel.innerHTML = '<option value="">All pools</option>' + pools.map(p=>`<option value="${esc(p)}">${esc(p)}</option>`).join('');
+  const provSel = document.getElementById('req-provider');
+  provSel.innerHTML = '<option value="">All providers</option>' + provs.map(p=>`<option value="${esc(p)}">${esc(p)}</option>`).join('');
+}
+function renderRequests() {
+  const el = document.getElementById('req-table');
+  let reqs = allRequests;
+  const search = document.getElementById('req-search')?.value || '';
+  const status = document.getElementById('req-status')?.value || '';
+  const pool = document.getElementById('req-pool')?.value || '';
+  const prov = document.getElementById('req-provider')?.value || '';
+  if (search) reqs = reqs.filter(r => (r.id||'').includes(search) || (r.final_provider||'').includes(search));
+  if (status === 'success') reqs = reqs.filter(r => r.final_status >= 200 && r.final_status < 300);
+  if (status === 'failed') reqs = reqs.filter(r => r.final_status >= 400);
+  if (pool) reqs = reqs.filter(r => r.pool === pool);
+  if (prov) reqs = reqs.filter(r => r.final_provider === prov);
+  // client-side pagination over filtered results
+  const total = reqs.length;
+  const startIndex = reqPage * reqLimit;
+  const endIndex = Math.min(startIndex + reqLimit, total);
+  const pageItems = reqs.slice(startIndex, endIndex);
+  if (!pageItems.length) { el.innerHTML = '<div class="p-6 text-sm text-on-surface-variant">No requests match.</div>'; return; }
+  const totalPages = Math.ceil(total / reqLimit);
+  el.innerHTML = `<table class="w-full text-left min-w-[800px]">
+    <thead><tr class="border-b border-outline-variant text-xs uppercase text-on-surface-variant font-bold">
+      <th class="py-2 px-3 w-10">Status</th><th class="py-2 px-3">Time (UTC)</th><th class="py-2 px-3">Request ID</th>
+      <th class="py-2 px-3">Pool</th><th class="py-2 px-3">Provider</th><th class="py-2 px-3 text-right">Latency</th>
+      <th class="py-2 px-3 text-right">Cost</th><th class="py-2 px-3">Routing Trail</th><th class="py-2 px-3 w-10"></th>
+    </tr></thead><tbody class="font-mono text-sm">
+    ${pageItems.map(r => `<tr class="border-b border-outline-variant hover:bg-surface-container cursor-pointer" data-action="openDetail" data-name="${esc(r.id)}">
+      <td class="py-2 px-3">${statusIcon(r.final_status)}</td>
+      <td class="py-2 px-3 text-xs text-on-surface-variant">${esc(r.ts)}</td>
+      <td class="py-2 px-3 text-xs text-on-surface-variant">${esc(r.id)}</td>
+      <td class="py-2 px-3">${poolChip(r.pool)}</td>
+      <td class="py-2 px-3">${esc(r.final_provider||'--')}</td>
+      <td class="py-2 px-3 text-right text-xs">${fmtMs(r.total_ms)}</td>
+      <td class="py-2 px-3 text-right text-xs">${fmtCost(r.cost)}</td>
+      <td class="py-2 px-3">${renderTrail(r)}</td>
+      <td class="py-2 px-3 text-outline"><span class="material-symbols-outlined" style="font-size:16px">chevron_right</span></td>
+    </tr>`).join('')}
+    </tbody></table>
+    <div class="flex justify-between items-center p-3 bg-surface-container-low border-t border-outline-variant">
+      <span class="text-sm text-on-surface-variant">Showing ${pageItems.length} of ${total} entries</span>
+      <div class="flex items-center gap-2">
+        <select onchange="setReqLimit(this.value)" class="border border-outline-variant bg-white rounded px-2 py-1 text-sm">
+          <option value="25" ${reqLimit===25?'selected':''}>25</option>
+          <option value="50" ${reqLimit===50?'selected':''}>50</option>
+          <option value="100" ${reqLimit===100?'selected':''}>100</option>
+        </select>
+        <button onclick="prevPage()" ${reqPage===0?'disabled':''} class="border border-outline-variant text-sm px-3 py-1 rounded hover:bg-surface-container-low ${reqPage===0?'opacity-50 cursor-not-allowed':''}">Prev</button>
+        <span class="text-sm text-on-surface-variant">Page ${totalPages > 0 ? reqPage+1 : 0} of ${totalPages}</span>
+        <button onclick="nextPage()" ${reqPage >= totalPages-1?'disabled':''} class="border border-outline-variant text-sm px-3 py-1 rounded hover:bg-surface-container-low ${reqPage >= totalPages-1?'opacity-50 cursor-not-allowed':''}">Next</button>
+      </div>
+    </div>`;
+}
+
+function openDetail(id) {
+  const r = allRequests.find(x => x.id === id); if (!r) return;
+  currentDetail = r;
+  document.getElementById('detail-id').textContent = r.id;
+  const body = document.getElementById('detail-body');
+  const atts = r.attempts || [];
+  const isExcluded = a => a.status === 0 && (a.err||'').startsWith('excluded');
+  const excluded = atts.filter(isExcluded);
+  const failed = atts.filter(a => !isExcluded(a) && (a.status >= 400 || a.status === 0));
+  const succeeded = atts.filter(a => a.status > 0 && a.status < 400);
+  function renderAttempt(a, i, isLast, kind) {
+    // kind: 'excluded' | 'failed' | 'ok'
+    const dot = kind === 'excluded' ? 'bg-trend-amber' : kind === 'failed' ? 'bg-trend-red' : 'bg-trend-green';
+    const ico = kind === 'excluded' ? 'block' : kind === 'failed' ? 'close' : 'check';
+    const label = kind === 'excluded' ? 'Excluded' : kind === 'failed' ? 'Failed (' + (a.status||0) + ')' : 'Success (' + a.status + ')';
+    return `<div class="relative pl-6 ${isLast?'':'pb-4'} border-l-2 border-outline-variant">
+      <div class="absolute -left-[7px] top-0 w-3.5 h-3.5 rounded-full ${dot} flex items-center justify-center">
+        <span class="material-symbols-outlined text-[8px] text-white">${ico}</span>
+      </div>
+      <div class="font-mono text-sm">${esc(a.provider)}:${esc(a.model)}</div>
+      <div class="flex items-center gap-2 flex-wrap">${label} · ${fmtMs(a.latency_ms)}</div>
+      ${(kind !== 'ok') ? failBadge(a) : ''}
+      ${a.err ? `<div class="text-xs text-trend-red font-mono whitespace-pre-wrap break-words mt-0.5">${esc(a.err)}</div>` : ''}
+    </div>`;
+  }
+  let trace = '';
+  if (excluded.length > 0) {
+    trace += '<div class="text-xs font-bold uppercase text-trend-amber mb-1">Excluded by Gate</div>';
+    trace += excluded.map((a,i) => renderAttempt(a, i, i === excluded.length-1, 'excluded')).join('');
+    if (failed.length > 0 || succeeded.length > 0) trace += '<div class="mt-3"></div>';
+  }
+  if (failed.length > 0) {
+    trace += '<div class="text-xs font-bold uppercase text-trend-red mb-1">Failed Attempts</div>';
+    trace += failed.map((a,i) => renderAttempt(a, i, i === failed.length-1, 'failed')).join('');
+    if (succeeded.length > 0) trace += '<div class="mt-3"></div>';
+  }
+  if (succeeded.length > 0) {
+    trace += '<div class="text-xs font-bold uppercase text-trend-green mb-1">Successful Attempt</div>';
+    trace += succeeded.map((a,i) => renderAttempt(a, i, i === succeeded.length-1, 'ok')).join('');
+  }
+  if (!trace) trace = '<div class="text-sm text-on-surface-variant">No attempts recorded.</div>';
+  // status with code
+  let statusText;
+  const hasNoKeyAttempt = () => {
+    const a = r.attempts || [];
+    return a.length > 0 && (a[a.length-1]?.err || '').includes('no API key configured');
+  };
+  if (r.final_status >= 200 && r.final_status < 300) statusText = 'Success (' + r.final_status + ')';
+  else if (r.final_status === 503 && (!r.attempts || (r.attempts||[]).length === 0)) statusText = 'Failed (503) — no key configured';
+  else if (r.final_status === 503 && hasNoKeyAttempt()) statusText = 'Failed (503) — no key configured';
+  else if (r.final_status === 503) statusText = 'Failed (503) — fallback exhausted';
+  else if (r.final_status >= 400) statusText = 'Failed (' + r.final_status + ')';
+  else statusText = (r.final_status||'--');
+  const statusColor = r.final_status >= 200 && r.final_status < 300 ? 'text-trend-green' : r.final_status >= 400 ? 'text-trend-red' : '';
+  // show the classification of the attempt that produced the final status, so
+  // operators can see at a glance *why* it failed (rate limit, token exhaust…)
+  const lastFail = failed.length ? failed[failed.length-1] : (r.final_status >= 400 ? (r.attempts||[]).slice().reverse().find(a => a.status >= 400 || (a.status === 0 && (a.err||'').length)) : null);
+  const finalFailBadge = lastFail ? failBadge(lastFail) : '';
+  // show error origin + reason below the status for failed requests
+  const statusSubtext = r.final_status >= 400 && r.error_origin
+    ? `<span class=\"text-xs text-on-surface-variant\">origin: ${esc(r.error_origin)}</span>`
+    : '';
+  body.innerHTML = `
+    <div class="grid grid-cols-2 gap-3">
+      <div><span class="text-xs font-bold uppercase text-outline">Status</span><div class="font-mono text-sm ${statusColor}">${statusText}</div>${finalFailBadge}${statusSubtext}</div>
+      <div><span class="text-xs font-bold uppercase text-outline">Time</span><div class="font-mono text-sm">${esc(r.ts)}</div></div>
+      <div><span class="text-xs font-bold uppercase text-outline">Pool</span><div>${poolChip(r.pool)}</div></div>
+      <div><span class="text-xs font-bold uppercase text-outline">Latency / Cost</span><div class="font-mono text-sm">${fmtMs(r.total_ms)} / ${fmtCost(r.cost)}</div></div>
+    </div>
+    <div class="flex flex-col gap-2"><span class="text-xs font-bold uppercase text-outline">Routing Trace</span>${trace}</div>
+    <div class="flex flex-col gap-2"><span class="text-xs font-bold uppercase text-outline">Tokens</span>
+      <div class="font-mono text-sm">Prompt: ${r.prompt_tokens||0} | Completion: ${r.completion_tokens||0} | Total: ${((r.prompt_tokens||0)+(r.completion_tokens||0))}</div>
+    </div>
+    <div class="flex flex-col gap-1"><span class="text-xs font-bold uppercase text-outline">Request</span>
+      ${renderBody(r.request_body, 'req')}
+    </div>
+    <div class="flex flex-col gap-1"><span class="text-xs font-bold uppercase text-outline">Response</span>
+      ${renderBody(r.response_body, 'resp')}
+    </div>
+    ${r.error_origin ? `<div class="flex flex-col gap-1"><span class="text-xs font-bold uppercase text-outline">Error Origin</span><div class="font-mono text-sm text-trend-red">${esc(r.error_origin)}</div></div>` : ''}`;
+  document.getElementById('detail-panel').classList.add('open');
+  history.pushState({detail:'request'}, '');
+}
+function closeDetail() { document.getElementById('detail-panel').classList.remove('open'); }
+function rerunRequest() { if (currentDetail) { showConfigToast('Re-run not implemented yet'); } }
+function copyRequestId() { if (currentDetail) { navigator.clipboard?.writeText(currentDetail.id); } }
+
+// classifyFailure maps a raw attempt error + status into a human category so
+// operators can see at a glance *why* a model failed (rate limit, context
+// overflow, too many tools, auth, etc.) instead of parsing raw error text.
+function classifyFailure(status, err, errorOrigin) {
+  err = (err || '').toString();
+  const e = err.toLowerCase();
+  const isRouter = errorOrigin === 'router';
+  // --- router-side structural errors (gate / config) ---
+  if (isRouter) {
+    if (e.startsWith('excluded:')) {
+      const reason = e.replace('excluded:', '').trim();
+      if (/(tool|function)/.test(reason)) return {key:'tools', label:'Tools not supported by model', short:'TOOLS'};
+      if (/(context|token|window|length)/.test(reason)) return {key:'context', label:'Context too large for model', short:'CTX'};
+      if (/(image|vision|audio|video|media)/.test(reason)) return {key:'media', label:'Media not supported by model', short:'MEDIA'};
+      return {key:'excluded', label:'Excluded by gate: ' + err.replace(/^excluded:\s*/i, ''), short:'GATE'};
+    }
+    if (e.includes('no api key')) return {key:'auth', label:'No API key configured', short:'NOKEY'};
+    if (e.includes('provider disabled') || e.includes('model disabled')) return {key:'disabled', label:'Provider/model disabled', short:'OFF'};
+    if (e.includes('base_url') || e.includes('no base')) return {key:'config', label:'Provider has no base_url', short:'CFG'};
+    if (e.includes('no candidates')) return {key:'config', label:'Pool has no candidates', short:'CFG'};
+    return {key:'router', label: err || 'Router rejected request', short:'ROUTER'};
+  }
+  // --- upstream errors ---
+  if (status === 429 || /rate.?limit|too many requests/i.test(e)) return {key:'ratelimit', label:'Rate limited', short:'RATE'};
+  if (/quota|usage.?limit|billing/i.test(e)) return {key:'quota', label:'Quota / usage exhausted', short:'QUOTA'};
+  if (/context.?length|context.?window|maximum context|token.?exceed|request.?length|prompt is too long|too long/i.test(e) || status === 413) return {key:'context', label:'Context / token limit exceeded', short:'CTX'};
+  if (/too many tools|max.*tools|number of tools|tools.?exceed|tool limit|functions.?exceed/i.test(e)) return {key:'tools', label:'Too many tools', short:'TOOLS'};
+  if (/max.*tokens|maximum.*tokens|token limit|max.?_?token/i.test(e)) return {key:'maxtokens', label:'Max tokens exceeded', short:'TOK'};
+  if (status === 401 || status === 403 || /unauthor|invalid.*key|api ?key|authentication|permission|forbidden/i.test(e)) return {key:'auth', label:'Auth / invalid key', short:'AUTH'};
+  if (status === 404 || /model.*not found|does not exist|unknown model|model.*missing/i.test(e)) return {key:'notfound', label:'Model not found', short:'404'};
+  if (/content.?filter|safety|moderation|flagged|policy/i.test(e)) return {key:'safety', label:'Content filtered (safety)', short:'SAFE'};
+  if (/timeout|deadline|took too long|timed out|context canceled|context cancelled|client disconnected|client closed/i.test(e)) return {key:'timeout', label: /context.?cancel|client (disconnect|close)/i.test(e) ? 'Client disconnected / request canceled' : 'Upstream timeout', short:'TIME'};
+  if (/connection|dns|no such host|refused|network|eof|i\/o|socket/i.test(e)) return {key:'network', label:'Connection / network error', short:'NET'};
+  if (status >= 500) return {key:'server', label:'Upstream server error (' + status + ')', short:'5xx'};
+  if (status >= 400) return {key:'client', label:'Upstream client error (' + status + ')', short:'4xx'};
+  return {key:'unknown', label: err || 'Unknown error', short:'ERR'};
+}
+const FAIL_CHIP_CLS = {
+  ratelimit: 'bg-trend-red/10 text-trend-red border-trend-red',
+  quota:     'bg-trend-red/10 text-trend-red border-trend-red',
+  context:   'bg-trend-amber/10 text-trend-amber border-trend-amber',
+  tools:     'bg-trend-amber/10 text-trend-amber border-trend-amber',
+  maxtokens: 'bg-trend-amber/10 text-trend-amber border-trend-amber',
+  auth:      'bg-trend-red/10 text-trend-red border-trend-red',
+  notfound:  'bg-trend-red/10 text-trend-red border-trend-red',
+  safety:    'bg-trend-amber/10 text-trend-amber border-trend-amber',
+  timeout:   'bg-trend-amber/10 text-trend-amber border-trend-amber',
+  network:   'bg-trend-amber/10 text-trend-amber border-trend-amber',
+  server:    'bg-trend-red/10 text-trend-red border-trend-red',
+  client:    'bg-trend-red/10 text-trend-red border-trend-red',
+  config:    'bg-trend-red/10 text-trend-red border-trend-red',
+  disabled:  'bg-trend-amber/10 text-trend-amber border-trend-amber',
+  excluded:  'bg-trend-amber/10 text-trend-amber border-trend-amber',
+  media:     'bg-trend-amber/10 text-trend-amber border-trend-amber',
+  router:    'bg-trend-red/10 text-trend-red border-trend-red',
+  unknown:   'bg-surface-container-high text-on-surface-variant border-outline-variant',
+};
+// small category chip for the routing trail
+function failChip(a) {
+  if (!a) return '';
+  const cf = classifyFailure(a.status, a.err, a.error_origin);
+  const cls = FAIL_CHIP_CLS[cf.key] || FAIL_CHIP_CLS.unknown;
+  return `<span class="text-[9px] font-mono px-1 py-0.5 rounded border ${cls}" title="${esc(cf.label)}">${esc(cf.short)}</span>`;
+}
+// larger badge for the detail-panel attempt trace
+function failBadge(a) {
+  if (!a) return '';
+  const cf = classifyFailure(a.status, a.err, a.error_origin);
+  const cls = FAIL_CHIP_CLS[cf.key] || FAIL_CHIP_CLS.unknown;
+  return `<span class="text-[10px] font-mono px-1.5 py-0.5 rounded border ${cls} inline-block">${esc(cf.label)}</span>`;
+}
+
+// --- model usage ---
+function renderModelUsage(models) {
+  const el = document.getElementById('home-model-usage');
+  if (!models || !models.length) { el.innerHTML = '<div class="p-6 text-sm text-on-surface-variant">No model usage data yet.</div>'; return; }
+  el.innerHTML = `<table class="w-full text-left min-w-[700px]">
+    <thead><tr class="border-b border-outline-variant text-xs uppercase text-on-surface-variant font-bold">
+      <th class="py-2 px-3">Model</th><th class="py-2 px-3 text-right">Tokens</th>
+      <th class="py-2 px-3">%</th><th class="py-2 px-3 text-right">Cost</th>
+      <th class="py-2 px-3 text-right">Attempts</th><th class="py-2 px-3 text-right">Success Rate</th>
+    </tr></thead><tbody class="font-mono text-sm">
+    ${models.map(m => `<tr class="border-b border-outline-variant hover:bg-surface-container">
+      <td class="py-3 px-3"><div class="flex items-center gap-2">${avatar(m.provider||m.model, baseUrlForProvider(m.provider))}<span>${esc(m.model)}</span></div></td>
+      <td class="py-3 px-3 text-right text-on-surface-variant">${fmtNum(m.tokens)}</td>
+      <td class="py-3 px-3"><div class="flex items-center gap-2"><div class="pct-bar"><div style="width:${m.pct||0}%"></div></div><span class="text-xs text-on-surface-variant w-8 text-right">${(m.pct||0).toFixed(0)}%</span></div></td>
+      <td class="py-3 px-3 text-right text-on-surface-variant">${fmtCost(m.cost)}</td>
+      <td class="py-3 px-3 text-right text-on-surface-variant">${m.attempts||0}</td>
+      <td class="py-3 px-3 text-right ${(m.success_rate||0)>=95?'text-trend-green':(m.success_rate||0)>=80?'text-trend-amber':'text-trend-red'}">${(m.success_rate||0).toFixed(1)}%</td>
+    </tr>`).join('')}
+    </tbody></table>`;
+}
+
+// --- config ---
+async function loadConfig() {
+  const r = await api('/api/config'); if (!r.ok || !r.data) return;
+  currentConfig = r.data;
+  renderProviders();
+  renderConfig();
+}
+// --- config modal (Hermes-style two-panel selector) ---
+let cfgModalState = {type: '', targetRow: null, selectedProvider: null, selectedModel: ''};
+let cfgSearchMode = 'provider'; // 'provider' | 'model'
+
+function setCfgSearchMode(mode) {
+  cfgSearchMode = mode;
+  document.querySelectorAll('.cfg-search-mode').forEach(b => b.classList.toggle('cfg-search-mode-active', b.dataset.mode === mode));
+  document.getElementById('cfg-modal-search').placeholder = mode === 'model' ? 'Search models...' : 'Search providers...';
+  document.getElementById('cfg-modal-search').value = '';
+  filterCfgModal();
+}
+
+function openCfgModal(type, targetRow, existingEntry) {
+  cfgModalState = {type, targetRow, selectedProvider: null, selectedModel: '', allProviders: {}};
+  cfgSearchMode = 'provider';
+  document.querySelectorAll('.cfg-search-mode').forEach(b => b.classList.toggle('cfg-search-mode-active', b.dataset.mode === 'provider'));
+  document.getElementById('cfg-modal-search').value = '';
+  document.getElementById('cfg-modal-search').placeholder = 'Search providers...';
+  document.getElementById('cfg-modal-title').textContent = type === 'tier' ? 'Select Model for Tier' : 'Select Model';
+  const statusEl = document.getElementById('cfg-modal-status');
+  if (statusEl) statusEl.textContent = 'Select a provider and model';
+  // render providers list
+  renderCfgModalProviders();
+  // if existing entry, pre-select
+  if (existingEntry) {
+    const [prov, model] = existingEntry.split(':');
+    if (prov) {
+      cfgModalState.selectedProvider = prov;
+      // wait for models to load then select
+      setTimeout(() => {
+        const modelSel = document.getElementById('cfg-modal-model-model');
+        if (modelSel) modelSel.value = model;
+        cfgModalState.selectedModel = model;
+        updateCfgModalStatus();
+      }, 100);
+    }
+  }
+  document.getElementById('cfg-selector-modal').classList.remove('hidden');
+}
+
+function closeCfgModal() {
+  document.getElementById('cfg-selector-modal').classList.add('hidden');
+}
+
+function renderCfgModalProviders() {
+  const provs = currentConfig.providers || {};
+  const container = document.getElementById('cfg-modal-providers');
+  container.innerHTML = Object.keys(provs).sort().map(name => {
+    const p = provs[name];
+    const icon = avatar(name, p.base_url);
+    return `<div data-action="selectCfgModalProvider" data-name="${esc(name)}" class="flex items-center gap-3 px-4 py-3 hover:bg-surface-container cursor-pointer ${cfgModalState.selectedProvider===name?'bg-surface-container':''}" data-prov="${esc(name)}">
+      ${icon}
+      <div class="flex-1 min-w-0">
+        <div class="font-medium text-sm">${esc(name)}</div>
+        <div class="text-xs text-on-surface-variant">${p.base_url?.split('/')[2]||''}</div>
+      </div>
+      <span class="text-xs text-on-surface-variant" id="prov-count-${esc(name)}">loading...</span>
+    </div>`;
+  }).join('');
+  // load model counts for each provider
+  Object.keys(provs).forEach(name => {
+    loadCfgModalModelCount(name);
+  });
+}
+
+async function loadCfgModalModelCount(providerName) {
+  const p = currentConfig.providers?.[providerName];
+  if (!p?.base_url) return;
+  const countEl = document.getElementById(`prov-count-${providerName}`);
+  try {
+    // route through router API to avoid CORS
+    const r = await api('/api/providers/' + encodeURIComponent(providerName) + '/models');
+    if (r.ok && r.data) {
+      const models = (r.data.models || r.data.data || []).map(m => m.id || m.name || m).filter(Boolean);
+      const provConfig = currentConfig.providers?.[providerName] || {};
+      const disabled = new Set(provConfig.disabled_models || []);
+      const available = models.filter(m => !disabled.has(m));
+      const count = available.length;
+      const total = models.length;
+      if (countEl) countEl.textContent = disabled.size ? count + '/' + total + ' models' : count + ' models';
+      providerModels[providerName] = models;
+    } else {
+      if (countEl) countEl.textContent = 'error';
+    }
+  } catch(e) {
+    if (countEl) countEl.textContent = 'offline';
+  }
+}
+
+function selectCfgModalProvider(name) {
+  cfgModalState.selectedProvider = name;
+  cfgModalState.selectedModel = '';
+  renderCfgModalModels(name);
+  // highlight selected
+  document.querySelectorAll('[data-prov]').forEach(el => {
+    el.classList.toggle('bg-surface-container', el.dataset.prov === name);
+  });
+  updateCfgModalStatus();
+}
+
+function renderCfgModalModels(providerName) {
+  const container = document.getElementById('cfg-modal-models');
+  if (!container) return;
+  const models = providerModels[providerName] || [];
+  const provConfig = (currentConfig.providers||{})[providerName] || {};
+  const disabled = new Set(provConfig.disabled_models || []);
+  const search = document.getElementById('cfg-modal-search').value.toLowerCase();
+  const filtered = models.filter(m => m.toLowerCase().includes(search) && !disabled.has(m));
+  container.innerHTML = filtered.length > 0 ? filtered.map(m => `
+    <div data-action="selectCfgModalModel" data-name="${esc(m)}" class="flex items-center gap-3 px-4 py-3 hover:bg-surface-container cursor-pointer ${cfgModalState.selectedModel===m?'bg-surface-container':''}" data-model="${esc(m)}">
+      <span class="material-symbols-outlined text-on-surface-variant">${modelIcon(m)}</span>
+      <span class="font-mono text-sm">${esc(m)}</span>
+    </div>
+  `).join('') : '<div class="p-4 text-sm text-on-surface-variant">No models found. Try a different search.</div>';
+}
+
+function selectCfgModalModel(model, el) {
+  cfgModalState.selectedModel = model;
+  // in cross-provider model-search mode the row carries data-pname — set the
+  // provider too so confirm works without a separate provider click
+  if (el && el.dataset.pname && cfgSearchMode === 'model') {
+    cfgModalState.selectedProvider = el.dataset.pname;
+    document.querySelectorAll('[data-prov]').forEach(p => p.classList.toggle('bg-surface-container', p.dataset.prov === el.dataset.pname));
+  }
+  // highlight
+  document.querySelectorAll('[data-model]').forEach(e2 => {
+    e2.classList.toggle('bg-surface-container', e2.dataset.model === model);
+  });
+  updateCfgModalStatus();
+}
+
+function filterCfgModal() {
+  const search = document.getElementById('cfg-modal-search').value.toLowerCase();
+  if (cfgSearchMode === 'model') {
+    // Search models across ALL providers (not just the selected one).
+    // Only providers with a matching model stay visible; each model row shows
+    // its provider name small underneath.
+    const provs = currentConfig.providers || {};
+    const provContainer = document.getElementById('cfg-modal-providers');
+    const out = {};
+    Object.keys(provs).forEach(pname => {
+      const models = providerModels[pname] || [];
+      const provConfig = provs[pname] || {};
+      const disabled = new Set(provConfig.disabled_models || []);
+      const matches = models.filter(m => !disabled.has(m) && m.toLowerCase().includes(search));
+      if (matches.length) out[pname] = matches;
+    });
+    // provider pane: only providers that have a matching model, + count
+    provContainer.innerHTML = Object.keys(out).sort().map(pname => {
+      return `<div data-action="selectCfgModalProvider" data-name="${esc(pname)}" data-prov="${esc(pname)}" class="flex items-center gap-3 px-4 py-3 hover:bg-surface-container cursor-pointer ${cfgModalState.selectedProvider===pname?'bg-surface-container':''}">
+        ${avatar(pname, (provs[pname]||{}).base_url)}
+        <div class="flex-1 min-w-0">
+          <div class="font-medium text-sm">${esc(pname)}</div>
+          <div class="text-xs text-on-surface-variant">${out[pname].length} match${out[pname].length>1?'es':''}</div>
+        </div>
+      </div>`;
+    }).join('') || '<div class="p-4 text-sm text-on-surface-variant">No providers with matching models.</div>';
+    // model pane: all matching models with provider name underneath
+    const modelContainer = document.getElementById('cfg-modal-models');
+    const modelHTML = Object.keys(out).sort().map(pname =>
+      out[pname].map(m => `
+        <div data-action="selectCfgModalModel" data-name="${esc(m)}" data-model="${esc(m)}" data-pname="${esc(pname)}" class="flex items-center gap-3 px-4 py-3 hover:bg-surface-container cursor-pointer ${cfgModalState.selectedModel===m?'bg-surface-container':''}">
+          <span class="material-symbols-outlined text-on-surface-variant">${modelIcon(m)}</span>
+          <div class="min-w-0">
+            <div class="font-mono text-sm truncate">${esc(m)}</div>
+            <div class="text-xs text-on-surface-variant">${esc(pname)}</div>
+          </div>
+        </div>
+      `).join('')
+    ).join('');
+    modelContainer.innerHTML = modelHTML || '<div class="p-4 text-sm text-on-surface-variant">No models match this search.</div>';
+    return;
+  }
+  // provider mode: filter providers by name; model pane shows the selected provider's models filtered
+  document.querySelectorAll('[data-prov]').forEach(el => {
+    const visible = el.dataset.prov.toLowerCase().includes(search);
+    el.style.display = visible ? '' : 'none';
+  });
+  if (cfgModalState.selectedProvider) {
+    renderCfgModalModels(cfgModalState.selectedProvider);
+  }
+}
+
+function updateCfgModalStatus() {
+  const status = document.getElementById('cfg-modal-status');
+  if (cfgModalState.selectedProvider && cfgModalState.selectedModel) {
+    status.innerHTML = `<span class="text-primary font-medium">${esc(cfgModalState.selectedProvider)}</span> · <span class="font-mono">${esc(cfgModalState.selectedModel)}</span>`;
+  } else if (cfgModalState.selectedProvider) {
+    status.textContent = 'Select a model from the list';
+  } else {
+    status.textContent = 'Select a provider and model';
+  }
+}
+
+function confirmCfgModal() {
+  if (!cfgModalState.selectedProvider || !cfgModalState.selectedModel) {
+    showConfigToast('Please select both a provider and a model.');
+    return;
+  }
+  const entry = cfgModalState.selectedProvider + ':' + cfgModalState.selectedModel;
+  const {targetRow, type} = cfgModalState;
+  // add entry to the row
+  const rowEl = document.getElementById(`row-${targetRow.containerId}-${targetRow.groupName}`);
+  const rid = newRowId();
+  const newEntry = document.createElement('div');
+  newEntry.className = 'cfg-row flex gap-2 items-center';
+  newEntry.setAttribute('data-row-id', rid);
+  newEntry.innerHTML = `
+    <select onchange="loadProviderModels(this.value, '${esc(targetRow.containerId)}', '${esc(targetRow.groupName)}', ${targetRow.rowIndex}, '${esc(rid)}')" class="border border-outline-variant bg-white rounded px-3 py-2 text-sm flex-1 provider-sel">
+      <option value="">Select provider…</option>${Object.keys(currentConfig.providers||{}).map(n => `<option value="${esc(n)}" ${n===cfgModalState.selectedProvider?'selected':''}>${esc(n)}</option>`).join('')}
+    </select>
+    <select class="border border-outline-variant bg-white rounded px-3 py-2 text-sm flex-1 model-sel">
+      <option value="">Select model…</option>${(providerModels[cfgModalState.selectedProvider]||[]).map(m => `<option value="${esc(m)}" ${m===cfgModalState.selectedModel?'selected':''}>${esc(m)}</option>`).join('')}
+    </select>
+    <button onclick="removeSelectorRow(this)" class="p-2 hover:bg-surface-container rounded"><span class="material-symbols-outlined text-base text-trend-red">delete</span></button>
+  `;
+  rowEl.appendChild(newEntry);
+  closeCfgModal();
+}
+
+function renderConfig() {
+  const c = currentConfig; if (!c) return;
+  // default pool selector
+  const defaultSel = document.getElementById('cfg-default');
+  const poolNames = Object.keys(c.pools || {});
+  defaultSel.innerHTML = poolNames.map(p=>`<option value="${esc(p)}" ${p===c.default?'selected':''}>${esc(p)}</option>`).join('');
+  // pools
+  renderSelectorGroup('cfg-pools', poolNames, c.pools || {}, 'pool');
+  // chains
+  const chainNames = Object.keys(c.chains || {});
+  renderSelectorGroup('cfg-chains', chainNames, c.chains || {}, 'chain');
+}
+
+// renderSelectorGroup renders a section with selector rows:
+//   name | provider dropdown | model dropdown | delete button
+// + "Add Row" button at bottom
+// editMode tracks which config sections are in edit mode
+const cfgEditMode = new Set();
+function renderSelectorGroup(containerId, groupNames, groupData, groupType) {
+  const container = document.getElementById(containerId);
+  const isEditing = cfgEditMode.has(containerId);
+  if (!groupNames.length) {
+    container.innerHTML = `<div class="flex flex-col gap-2">
+      <p class="text-sm text-on-surface-variant">Not configured yet.</p>
+      <div class="flex gap-2 items-center">
+        <input type="text" id="new-${esc(containerId)}-name" placeholder="New ${esc(groupType)} name…" class="border border-outline-variant bg-white rounded px-3 py-2 text-sm flex-1" onkeydown="if(event.key==='Enter')createGroup('${esc(containerId)}', '${esc(groupType)}')" />
+        <button data-action="createGroup" data-container="${esc(containerId)}" data-type="${esc(groupType)}" class="bg-primary text-on-primary text-sm px-3 py-2 rounded hover:opacity-90 whitespace-nowrap flex items-center gap-1"><span class="material-symbols-outlined text-base">add</span>Create</button>
+      </div>
+    </div>`;
+    return;
+  }
+  container.innerHTML = groupNames.map(name => {
+    const entries = groupData[name] || [];
+    return `<div class="border border-outline-variant rounded p-4 bg-surface-container-lowest flex flex-col gap-3 overflow-hidden">
+      <div class="flex items-center justify-between">
+        <span class="text-sm font-medium text-primary">${esc(name)}</span>
+        <div class="flex items-center gap-2" style="${isEditing ? '' : 'display:none'}" data-edit-controls>
+          <button data-action="saveGroup" data-container="${esc(containerId)}" data-name="${esc(name)}" data-type="${esc(groupType)}" class="bg-primary text-on-primary text-sm px-3 py-1.5 rounded hover:opacity-90">Save</button>
+          <button data-action="removeRow" data-container="${esc(containerId)}" data-name="${esc(name)}" class="text-trend-red text-sm px-2 hover:underline">Delete</button>
+        </div>
+      </div>
+      <div class="flex flex-col gap-2" id="row-${esc(containerId)}-${esc(name)}">
+        ${entries.map((entry, i) => renderSelectorRow(containerId, name, groupType, entry, i, newRowId())).join('')}
+      </div>
+      <button data-action="openCfgModalForAdd" data-container="${esc(containerId)}" data-name="${esc(name)}" data-type="${esc(groupType)}" class="text-sm text-primary hover:underline self-start flex items-center gap-1" style="${isEditing ? '' : 'display:none'}" data-edit-controls><span class="material-symbols-outlined text-base">add</span>Add Model</button>
+    </div>`;
+  }).join('') + `<div class="flex gap-2 items-center mt-2" style="${isEditing ? '' : 'display:none'}" data-edit-controls>
+    <input type="text" id="new-${esc(containerId)}-name" placeholder="New ${esc(groupType)} name…" class="border border-outline-variant bg-white rounded px-3 py-2 text-sm flex-1 max-w-xs" onkeydown="if(event.key==='Enter')createGroup('${esc(containerId)}', '${esc(groupType)}')" />
+    <button data-action="createGroup" data-container="${esc(containerId)}" data-type="${esc(groupType)}" class="bg-primary text-on-primary text-sm px-3 py-2 rounded hover:opacity-90 whitespace-nowrap flex items-center gap-1"><span class="material-symbols-outlined text-base">add</span>Add ${esc(groupType)}</button>
+  </div>`;
+  // add edit toggle button after the group content
+  const editBtn = document.createElement('div');
+  editBtn.className = 'flex justify-end mt-2';
+  editBtn.innerHTML = `<button data-action="toggleCfgEditMode" data-container="${esc(containerId)}" class="text-sm text-primary hover:underline flex items-center gap-1"><span class="material-symbols-outlined text-base">${isEditing ? 'check' : 'edit'}</span>${isEditing ? 'Done' : 'Edit'}</button>`;
+  container.appendChild(editBtn);
+  // enable drag reorder
+  enableDragReorder(container);
+  // setup custom dropdowns for selector rows
+  setupCustomDropdowns(container);
+}
+function toggleCfgEditMode(containerId) {
+  if (cfgEditMode.has(containerId)) {
+    cfgEditMode.delete(containerId);
+  } else {
+    cfgEditMode.add(containerId);
+  }
+  // re-render from existing currentConfig — do NOT refetch from server
+  // (avoids wiping unsaved dropdown changes in other sections)
+  if (containerId === 'cfg-pools') {
+    const poolNames = Object.keys(currentConfig.pools || {});
+    renderSelectorGroup('cfg-pools', poolNames, currentConfig.pools || {}, 'pool');
+  } else if (containerId === 'cfg-chains') {
+    const chainNames = Object.keys(currentConfig.chains || {});
+    renderSelectorGroup('cfg-chains', chainNames, currentConfig.chains || {}, 'chain');
+  }
+}
+async function removeRow(containerId, groupName) {
+  const groupType = containerId === 'cfg-chains' ? 'chain' : 'pool';
+  if (groupType === 'chain') {
+    const r = await api('/api/config/chains', {method:'DELETE', body:JSON.stringify({name:groupName})});
+    if (r.ok) { await loadConfig(); showConfigToast('Chain "' + groupName + '" deleted'); }
+    else { showConfigStatus(containerId, 'Failed: ' + (r.data?.error || r.status), 'error'); }
+  } else {
+    // pools can't be removed, just clear entries
+    const r = await api('/api/config/pools', {method:'POST', body:JSON.stringify({pool:groupName, entries:[]})});
+    if (r.ok) { await loadConfig(); showConfigToast('Pool "' + groupName + '" cleared'); }
+    else { showConfigStatus(containerId, 'Failed: ' + (r.data?.error || r.status), 'error'); }
+  }
+}
+
+function renderSelectorRow(containerId, groupName, groupType, entry, index, rowId) {
+  const idx = entry.indexOf(':');
+  const provider = idx === -1 ? entry : entry.slice(0, idx);
+  const model = idx === -1 ? '' : entry.slice(idx + 1);
+  const isEditing = cfgEditMode.has(containerId);
+  const rid = rowId || ('row-' + index); // stable id if caller supplies one
+  if (!isEditing) {
+    return `<div class="flex gap-2 items-center cfg-row py-1">
+      <span class="font-mono text-sm truncate flex-1 min-w-0">${esc(provider)}:${esc(model)}</span>
+    </div>`;
+  }
+  const provConfig = (currentConfig.providers||{})[provider] || {};
+  const disabled = new Set(provConfig.disabled_models || []);
+  const enabledProviders = Object.entries(currentConfig.providers||{})
+    .filter(([n,p]) => p.enabled !== false)
+    .map(([n]) => n);
+  // Per-row model list: use the stable row id, NOT providerModels[provider]
+  // (shared cache). rowModels[rid] holds this row's fetched models even after
+  // other rows fetch different providers.
+  const rowState = rowModels[rid];
+  const rowProv = rowState ? rowState.provider : null;
+  const rowList = rowState ? rowState.models : (providerModels[provider] || []);
+  const usable = rowState && rowState.provider === provider ? rowList : (providerModels[provider] || []);
+  const filteredModels = usable.filter(m => !disabled.has(m));
+  return `<div class="flex gap-2 items-start cfg-row" draggable="true" data-row-id="${esc(rid)}">
+    <div class="flex flex-col gap-1 mt-1">
+      <button onclick="moveRow(this, -1)" class="text-outline hover:text-primary p-0.5" title="Move up"><span class="material-symbols-outlined text-base">arrow_upward</span></button>
+      <button onclick="moveRow(this, 1)" class="text-outline hover:text-primary p-0.5" title="Move down"><span class="material-symbols-outlined text-base">arrow_downward</span></button>
+    </div>
+    <div class="flex flex-col gap-2 flex-1 min-w-0">
+      <select onchange="loadProviderModels(this.value, '${esc(containerId)}', '${esc(groupName)}', ${index}, '${esc(rid)}')" class="provider-sel hidden">
+        <option value="">Select provider…</option>
+        ${provider && !enabledProviders.includes(provider) ? `<option value="${esc(provider)}" selected>${esc(provider)}</option>` : ''}
+        ${enabledProviders.map(n => `<option value="${esc(n)}" ${n===provider?'selected':''}>${esc(n)}</option>`).join('')}
+      </select>
+      <div class="custom-dropdown" data-container="${esc(containerId)}" data-row="${index}" data-row-id="${esc(rid)}" data-type="provider">
+        <div class="cd-trigger border border-outline-variant bg-white rounded px-3 py-2 text-sm w-full flex items-center justify-between cursor-pointer">
+          <span class="cd-selected font-mono truncate flex-1 min-w-0">${esc(provider)}</span>
+          <span class="material-symbols-outlined text-sm text-on-surface-variant">expand_more</span>
+        </div>
+        <div class="cd-menu absolute z-50 hidden border border-outline-variant bg-white rounded shadow-lg w-full" style="max-height: 256px; overflow: hidden;">
+          <input type="text" class="cd-search border-b border-outline-variant px-3 py-2 text-sm w-full" placeholder="Search provider…" autocomplete="off">
+          <div class="cd-options overflow-y-auto" style="max-height: 200px;">
+            ${enabledProviders.map(n => `<div class="cd-option px-3 py-2 text-sm cursor-pointer hover:bg-surface-container font-mono" data-value="${esc(n)}">${esc(n)}</div>`).join('')}
+          </div>
+        </div>
+      </div>
+      <select class="model-sel hidden">
+        <option value="">Select model…</option>
+        ${model && !filteredModels.includes(model) ? `<option value="${esc(model)}" selected>${esc(model)}</option>` : ''}
+        ${filteredModels.length ? filteredModels.map(m => `<option value="${esc(m)}" ${m===model?'selected':''}>${esc(m)}</option>`).join('') : '<option value="">-- select or fetch first --</option>'}
+      </select>
+      <div class="custom-dropdown" data-container="${esc(containerId)}" data-row="${index}" data-row-id="${esc(rid)}" data-type="model">
+        <div class="cd-trigger border border-outline-variant bg-white rounded px-3 py-2 text-sm w-full flex items-center justify-between cursor-pointer">
+          <span class="cd-selected font-mono truncate flex-1 min-w-0">${esc(model)}</span>
+          <span class="material-symbols-outlined text-sm text-on-surface-variant">expand_more</span>
+        </div>
+        <div class="cd-menu absolute z-50 hidden border border-outline-variant bg-white rounded shadow-lg w-full" style="max-height: 256px; overflow: hidden;">
+          <input type="text" class="cd-search border-b border-outline-variant px-3 py-2 text-sm w-full" placeholder="Search model…" autocomplete="off">
+          <div class="cd-options overflow-y-auto" style="max-height: 200px;">
+            ${filteredModels.length ? filteredModels.map(m => `<div class="cd-option px-3 py-2 text-sm cursor-pointer hover:bg-surface-container font-mono" data-value="${esc(m)}">${esc(m)}</div>`).join('') : '<div class="px-3 py-2 text-sm text-on-surface-variant">No models — fetch first</div>'}
+          </div>
+        </div>
+      </div>
+    </div>
+    <button onclick="removeSelectorRow(this)" class="p-2 hover:bg-surface-container rounded mt-1"><span class="material-symbols-outlined text-base text-trend-red">delete</span></button>
+  </div>`;
+}
+
+// Custom dropdown handlers for config selector rows
+function setupCustomDropdowns(container) {
+  const dropdowns = container.querySelectorAll('.custom-dropdown');
+  dropdowns.forEach(dd => {
+    const trigger = dd.querySelector('.cd-trigger');
+    const menu = dd.querySelector('.cd-menu');
+    const selectedSpan = dd.querySelector('.cd-selected');
+    const searchInput = dd.querySelector('.cd-search');
+    const optionsDiv = dd.querySelector('.cd-options');
+    const hiddenSelect = dd.closest('.cfg-row')?.querySelector('select.hidden');
+
+    // Only attach if not already attached
+    if (dd.dataset.bound === 'true') return;
+    dd.dataset.bound = 'true';
+
+    dd.addEventListener('click', function(e) { e.stopPropagation(); });
+
+    trigger.addEventListener('click', function(e) {
+      e.stopPropagation();
+      const isOpen = !menu.classList.contains('hidden');
+      // close all other menus
+      document.querySelectorAll('.custom-dropdown .cd-menu').forEach(m => m.classList.add('hidden'));
+      if (!isOpen) {
+        menu.classList.remove('hidden');
+        searchInput.value = '';
+        filterDropdownOptions(optionsDiv, searchInput.value);
+        searchInput.focus();
+      }
+    });
+
+    // search input
+    searchInput.addEventListener('input', function(e) {
+      filterDropdownOptions(optionsDiv, e.target.value);
+    });
+    searchInput.addEventListener('keydown', function(e) {
+      if (e.key === 'Escape') { e.stopPropagation(); menu.classList.add('hidden'); }
+    });
+
+    // option click
+    optionsDiv.addEventListener('click', function(e) {
+      const opt = e.target.closest('.cd-option');
+      if (!opt) return;
+      const val = opt.dataset.value;
+      selectedSpan.textContent = val;
+      // sync hidden select
+      const sel = dd.closest('.cfg-row')?.querySelector(dd.dataset.type === 'provider' ? '.provider-sel' : '.model-sel');
+      if (sel) sel.value = val;
+      syncDropdownState(dd);
+      menu.classList.add('hidden');
+      // trigger onchange for model loading
+      if (dd.dataset.type === 'provider') {
+        const containerId = dd.dataset.container;
+        // Derive the row index from the *current* DOM position rather than the
+        // stored data-row attribute. After a drag-reorder, reindexRows() updates
+        // the hidden <select> handlers but not data-row, so relying on it would
+        // re-introduce the cross-row mismatch (selecting groq would load into
+        // cerebras). Computing it live keeps loadProviderModels pointed at the
+        // right row no matter how the rows have been reordered.
+        const groupEl = dd.closest('[id^="row-"]');
+        const rowEl = dd.closest('.cfg-row');
+        const rowIdx = groupEl && rowEl ? Array.from(groupEl.querySelectorAll('.cfg-row')).indexOf(rowEl) : 0;
+        const rowId = rowEl ? rowEl.getAttribute('data-row-id') : '';
+        const groupName = groupEl ? groupEl.id.replace('row-' + containerId + '-', '') : '';
+        setTimeout(() => loadProviderModels(val, containerId, groupName, rowIdx, rowId), 10);
+      }
+    });
+
+    // sync to hidden select on init
+    syncDropdownState(dd);
+  });
+}
+
+function syncDropdownState(dd) {
+  const selectedSpan = dd.querySelector('.cd-selected');
+  const sel = dd.closest('.cfg-row')?.querySelector(dd.dataset.type === 'provider' ? '.provider-sel' : '.model-sel');
+  if (sel && sel.value) {
+    const selectedOpt = Array.from(sel.options).find(o => o.value === sel.value);
+    if (selectedOpt) selectedSpan.textContent = selectedOpt.textContent || sel.value;
+  }
+}
+
+function filterDropdownOptions(optionsDiv, search) {
+  const term = search.toLowerCase();
+  optionsDiv.querySelectorAll('.cd-option').forEach(opt => {
+    opt.style.display = opt.dataset.value.toLowerCase().includes(term) ? '' : 'none';
+  });
+}
+
+// close dropdowns when clicking elsewhere
+document.addEventListener('click', function(e) {
+  if (!e.target.closest('.custom-dropdown')) {
+    document.querySelectorAll('.custom-dropdown .cd-menu').forEach(m => m.classList.add('hidden'));
+  }
+});
+
+// updateModelDropdown was removed: loadProviderModels now updates the model
+// dropdown options and the custom-dropdown display inline, so this helper
+// (which used a broken selector and was never called) was dead code.
+function moveRow(btn, dir) {
+  const row = btn.closest('.cfg-row');
+  const container = row.parentElement;
+  const rows = [...container.children];
+  const idx = rows.indexOf(row);
+  const target = idx + dir;
+  if (target < 0 || target >= rows.length) return;
+  if (dir < 0) container.insertBefore(row, rows[target]);
+  else container.insertBefore(row, rows[target+1] || null);
+  reindexRows(container);
+}
+
+function enableDragReorder(container) {
+  // Guard per row so repeated calls (e.g. after each "Add Model") don't stack
+  // duplicate drag listeners on the pre-existing rows. The shared in-flight
+  // drag element is stored on the container so all bound handlers agree.
+  container.querySelectorAll('.cfg-row').forEach(row => {
+    if (row.dataset.dragBound === 'true') return;
+    row.dataset.dragBound = 'true';
+    row.addEventListener('dragstart', (e) => { container._dragEl = row; row.style.opacity = '0.4'; e.dataTransfer.effectAllowed = 'move'; });
+    row.addEventListener('dragend', () => { if (container._dragEl) { container._dragEl.style.opacity = ''; container._dragEl = null; } reindexRows(container); });
+    row.addEventListener('dragover', (e) => { e.preventDefault(); const after = getDragAfterElement(container, e.clientY); if (after == null) container.appendChild(container._dragEl); else container.insertBefore(container._dragEl, after); });
+  });
+}
+function getDragAfterElement(container, y) {
+  const els = [...container.querySelectorAll('.cfg-row:not(.opacity-40)')];
+  return els.reduce((closest, child) => {
+    const box = child.getBoundingClientRect();
+    const offset = y - box.top - box.height / 2;
+    if (offset < 0 && offset > closest.offset) return { offset, element: child };
+    return closest;
+  }, { offset: -Infinity }).element;
+}
+function reindexRows(container) {
+  // reindex the row indices in onchange handlers after drag reorder
+  const groups = container.querySelectorAll('[id^="row-"]');
+  groups.forEach(group => {
+    const rows = group.querySelectorAll('.cfg-row');
+    rows.forEach((row, i) => {
+      // keep the custom dropdown's stored row index in sync too, so any path
+      // that reads data-row (not just the live-DOM computation) stays correct.
+      const dd = row.querySelector('.custom-dropdown[data-type="provider"]');
+      if (dd) dd.dataset.row = String(i);
+      const provSel = row.querySelector('.provider-sel');
+      if (provSel) {
+        const containerId = container.id;
+        const groupName = group.id.replace(`row-${containerId}-`, '');
+        const rid = row.getAttribute('data-row-id') || '';
+        provSel.onchange = () => loadProviderModels(provSel.value, containerId, groupName, i, rid);
+      }
+    });
+  });
+}
+
+function createGroup(containerId, groupType) {
+  const input = document.getElementById('new-' + containerId + '-name');
+  const name = input ? input.value.trim() : '';
+  if (!name) return;
+  input.value = '';
+  // create empty group then render
+  if (groupType === 'chain') currentConfig.chains = currentConfig.chains || {};
+  if (groupType === 'pool') currentConfig.pools = currentConfig.pools || {};
+  const target = groupType === 'chain' ? currentConfig.chains : currentConfig.pools;
+  target[name] = [];
+  renderConfig();
+}
+
+async function loadProviderModels(providerName, containerId, groupName, rowIdx, rowId) {
+  if (!providerName) return;
+  const rowEl = document.querySelector('#row-' + CSS.escape(containerId) + '-' + CSS.escape(groupName));
+  if (!rowEl) return;
+  // Target the *specific* row by a STABLE rowId. Rows are given a unique id
+  // (newRowId()) when created, so this never indexes into a reordered/removed
+  // sibling. Passing an index is legacy; the onchange handler passes rowId.
+  let row;
+  if (rowId) {
+    row = rowEl.querySelector(`.cfg-row[data-row-id="${rowId}"]`) || rowEl.querySelectorAll('.cfg-row')[rowIdx];
+  } else {
+    row = rowEl.querySelectorAll('.cfg-row')[rowIdx];
+  }
+  if (!row) return;
+  // Race guard: each call for this row bumps its token. If a newer fetch for
+  // the same row fired after us, its token is higher and we must NOT overwrite
+  // the row's model state when we resolve late — otherwise an out-of-order
+  // response would clobber the row that asked later.
+  const token = (rowFetchToken[rowId] || 0) + 1;
+  if (rowId) rowFetchToken[rowId] = token;
+  // set this row's provider + loading state scoped to the row id
+  if (rowId) rowModels[rowId] = { provider: providerName, models: [] };
+  const sel = row.querySelector('.model-sel');
+  if (!sel) return;
+  const dd = row.querySelector('.custom-dropdown[data-type="model"]');
+  const setLoading = () => {
+    sel.innerHTML = '<option value="">loading…</option>';
+    if (dd) {
+      dd.querySelector('.cd-selected').textContent = 'loading…';
+      dd.querySelector('.cd-options').innerHTML = '<div class="px-3 py-2 text-sm text-on-surface-variant">loading…</div>';
+    }
+  };
+  setLoading();
+  try {
+    const r = await api('/api/providers/' + encodeURIComponent(providerName) + '/models');
+    // Out-of-order response guard: if a newer fetch for this row started while
+    // this one was in flight, drop this result (a later one will land).
+    if (rowId && token !== rowFetchToken[rowId]) return;
+    if (!r.ok || !r.data) { sel.innerHTML = '<option value="">failed to load</option>'; if(dd){dd.querySelector('.cd-selected').textContent='failed to load';dd.querySelector('.cd-options').innerHTML='<div class="px-3 py-2 text-sm text-on-surface-variant">failed to load</div>';} return; }
+    const models = (r.data.models || r.data.data || []).map(m => m.id || m.name || m).filter(Boolean);
+    // write to BOTH the shared provider cache AND this row's scoped state
+    providerModels[providerName] = models;
+    if (rowId) rowModels[rowId] = { provider: providerName, models };
+    const provConfig = (currentConfig.providers||{})[providerName] || {};
+    const disabled = new Set(provConfig.disabled_models || []);
+    const filtered = models.filter(m => !disabled.has(m));
+    const currentModel = sel.value;
+    sel.innerHTML = '<option value="">Select model…</option>' + filtered.map(m => `<option value="${esc(m)}" ${m===currentModel?'selected':''}>${esc(m)}</option>`).join('');
+    // update custom dropdown options
+    if (dd) {
+      const optionsDiv = dd.querySelector('.cd-options');
+      const selectedSpan = dd.querySelector('.cd-selected');
+      if (filtered.length === 0) {
+        optionsDiv.innerHTML = '<div class="px-3 py-2 text-sm text-on-surface-variant">No models available</div>';
+        selectedSpan.textContent = 'No models';
+      } else {
+        optionsDiv.innerHTML = filtered.map(m => `<div class="cd-option px-3 py-2 text-sm cursor-pointer hover:bg-surface-container font-mono" data-value="${esc(m)}">${esc(m)}</div>`).join('');
+        if (currentModel && filtered.includes(currentModel)) {
+          selectedSpan.textContent = currentModel;
+        }
+      }
+    }
+  } catch(e) {
+    if (rowId && token !== rowFetchToken[rowId]) return;
+    sel.innerHTML = '<option value="">connection failed</option>';
+    if (dd) { dd.querySelector('.cd-selected').textContent = 'connection failed'; dd.querySelector('.cd-options').innerHTML = '<div class="px-3 py-2 text-sm text-on-surface-variant">connection failed</div>'; }
+  }
+}
+
+// openCfgModalForAdd appends a new blank provider:model row to a pool or chain
+// group in the config page. The row uses the same custom-dropdown UI as existing
+// rows, pre-loaded with the current provider list and an empty model list.
+function openCfgModalForAdd(containerId, groupName, groupType) {
+  const rowContainer = document.getElementById(`row-${containerId}-${groupName}`);
+  if (!rowContainer) return;
+  const entries = getGroupEntries(containerId, groupName);
+  const index = entries.length;
+  const rid = newRowId();
+  // render a blank row with the first enabled provider pre-selected
+  const enabledProviders = Object.entries(currentConfig.providers||{})
+    .filter(([n,p]) => p.enabled !== false)
+    .map(([n]) => n);
+  const defaultProvider = enabledProviders[0] || '';
+  const html = renderSelectorRow(containerId, groupName, groupType, ':', index, rid);
+  const div = document.createElement('div');
+  div.innerHTML = html;
+  rowContainer.appendChild(div.firstElementChild);
+  // setup custom dropdowns for the new row
+  setupCustomDropdowns(rowContainer);
+  // enable drag reorder for the new row
+  enableDragReorder(rowContainer);
+  // if a provider is selected, auto-load its models (scoped to this row's id)
+  if (defaultProvider) {
+    const provSel = rowContainer.querySelector(`.cfg-row[data-row-id="${rid}"] .provider-sel`);
+    if (provSel) {
+      provSel.value = defaultProvider;
+      loadProviderModels(defaultProvider, containerId, groupName, index, rid);
+    }
+  }
+}
+
+// (keep the old addRow function for backwards compat, but prefer openCfgModalForAdd)
+async function addRow(containerId, groupName, groupType) {
+  openCfgModalForAdd(containerId, groupName, groupType);
+}
+
+function removeSelectorRow(btn) {
+  // use the semantic .cfg-row class as identity (added by renderSelectorRow and
+  // confirmCfgModal) rather than the utility classes, which are fragile.
+  const row = btn.closest('.cfg-row');
+  if (!row) return;
+  const rid = row.getAttribute('data-row-id');
+  if (rid) {
+    // drop this row's scoped state so a late in-flight fetch for a removed
+    // row can't re-apply (token guard) and so we don't leak memory.
+    delete rowModels[rid];
+    delete rowFetchToken[rid];
+  }
+  row.remove();
+}
+
+function getGroupEntries(containerId, groupName) {
+  const rows = document.querySelectorAll(`#row-${containerId}-${groupName} .cfg-row`);
+  const entries = [];
+  rows.forEach(row => {
+    const provider = row.querySelector('.provider-sel')?.value?.trim();
+    const model = row.querySelector('.model-sel')?.value?.trim();
+    if (provider && model) entries.push(provider + ':' + model);
+  });
+  return entries;
+}
+
+async function saveGroup(containerId, groupName, groupType) {
+  const entries = getGroupEntries(containerId, groupName);
+  const apiPath = groupType === 'chain' ? '/api/config/chains' : '/api/config/pools';
+  const body = groupType === 'pool' ? {pool: groupName, entries} : {name: groupName, entries};
+  const r = await api(apiPath, {method:'POST', body:JSON.stringify(body)});
+  if (r.ok) {
+    // update currentConfig in place — don't refetch (preserves edit mode)
+    if (groupType === 'pool') currentConfig.pools[groupName] = entries;
+    else currentConfig.chains[groupName] = entries;
+    // re-render just this section
+    if (containerId === 'cfg-pools') {
+      renderSelectorGroup('cfg-pools', Object.keys(currentConfig.pools||{}), currentConfig.pools||{}, 'pool');
+    } else {
+      renderSelectorGroup('cfg-chains', Object.keys(currentConfig.chains||{}), currentConfig.chains||{}, 'chain');
+    }
+    showConfigToast(groupType + ' "' + groupName + '" saved');
+  } else {
+    showConfigStatus(containerId, 'Failed: ' + (r.data?.error || r.status), 'error');
+  }
+}
+
+function showConfigStatus(containerId, msg, type) {
+  // simple inline feedback -- append toast near container
+  const el = document.getElementById(containerId);
+  if (!el) return;
+  const color = type === 'error' ? 'text-trend-red' : 'text-trend-green';
+  const toast = document.createElement('p');
+  toast.className = `text-sm ${color}`;
+  toast.textContent = msg;
+  el.prepend(toast);
+  setTimeout(() => toast.remove(), 3000);
+}
+function showConfigToast(msg, isError) {
+  let toast = document.getElementById('cfg-toast');
+  if (!toast) {
+    toast = document.createElement('div');
+    toast.id = 'cfg-toast';
+    toast.className = 'fixed top-4 right-4 z-50 border text-sm px-4 py-2 shadow-md transition-opacity duration-300';
+    document.body.appendChild(toast);
+  }
+  toast.className = 'fixed top-4 right-4 z-50 border text-sm px-4 py-2 shadow-md transition-opacity duration-300 ' + (isError ? 'bg-trend-red/10 border-trend-red text-trend-red' : 'bg-surface-container-high border-outline-variant');
+  toast.textContent = msg;
+  toast.style.opacity = '1';
+  clearTimeout(toast._timeout);
+  toast._timeout = setTimeout(() => { toast.style.opacity = '0'; }, 2500);
+}
+function showProvToast(msg, isError) {
+  let toast = document.getElementById('prov-toast');
+  if (!toast) {
+    toast = document.createElement('div');
+    toast.id = 'prov-toast';
+    toast.className = 'fixed top-4 right-4 z-50 border text-sm px-4 py-2 shadow-md transition-opacity duration-300';
+    document.body.appendChild(toast);
+  }
+  toast.className = 'fixed top-4 right-4 z-50 border text-sm px-4 py-2 shadow-md transition-opacity duration-300 ' + (isError ? 'bg-trend-red/10 border-trend-red text-trend-red' : 'bg-surface-container-high border-outline-variant');
+  toast.textContent = msg;
+  toast.style.opacity = '1';
+  clearTimeout(toast._timeout);
+  toast._timeout = setTimeout(() => { toast.style.opacity = '0'; }, 2500);
+}
+
+async function saveDefault() {
+  const v = document.getElementById('cfg-default').value;
+  const r = await api('/api/config/default', {method:'POST', body:JSON.stringify({pool:v})});
+  if (!r.ok) showConfigStatus('cfg-default', 'Failed: ' + (r.data?.error||r.status), 'error');
+  else showConfigStatus('cfg-default', 'Saved.', 'ok');
+}
+
+// --- providers ---
+function renderProviders() {
+  const provs = currentConfig.providers || {};
+  const names = Object.keys(provs);
+  // Preset providers first (openrouter, ollama — flagged "preset":true by the
+  // server), then custom providers alphabetically below.
+  const presets = names.filter(n => provs[n].preset).sort();
+  const customs = names.filter(n => !provs[n].preset).sort();
+  const active = names.filter(n => provs[n].enabled).length;
+  document.getElementById('prov-subtitle').textContent = `${active} active, ${names.length} total`;
+  const el = document.getElementById('prov-list');
+  const card = (name) => {
+    const p = provs[name]; const enabled = p.enabled;
+    const keys = p.keys || []; const keyCount = keys.length;
+    const isLocal = (p.base_url||'').includes('127.0.0.1') || (p.base_url||'').includes('localhost');
+    const needsKeys = !isLocal;
+    const dotCls = !enabled ? 'bg-gray-400' : keyCount === 0 && needsKeys ? 'bg-trend-amber' : 'bg-trend-green';
+    const dotTitle = !enabled ? 'disabled' : keyCount === 0 && needsKeys ? 'enabled but no keys' : 'healthy';
+    const keyLabel = keyCount === 0 ? (isLocal ? 'not required' : 'no keys') : keyCount + ' key' + (keyCount>1?'s':'');
+    const keyCls = keyCount === 0 && needsKeys ? 'text-trend-amber' : '';
+    return `<div class="border border-outline-variant rounded p-4 bg-surface-container-lowest flex flex-col gap-2 ${enabled?'':'opacity-60'}">
+      <div class="flex justify-between items-center">
+        <div class="flex items-center gap-2">
+          <span class="w-2.5 h-2.5 rounded-full ${dotCls}" title="${dotTitle}"></span>
+          <span class="font-medium">${avatar(name, p.base_url)} ${esc(name)}</span>
+        </div>
+        <div class="flex items-center gap-3">
+          <div class="toggle-sw ${enabled?'on':''}" data-action="toggleProvider" data-name="${esc(name)}" data-enabled="${!enabled}"></div>
+          <button class="border border-outline-variant text-sm px-3 py-1 rounded hover:bg-surface-container-low" data-action="openProvDetail" data-name="${esc(name)}">View Details</button>
+          <button class="text-trend-red text-sm px-3 py-1 hover:underline" data-action="deleteProvider" data-name="${esc(name)}">Delete</button>
+        </div>
+      </div>
+      <div class="text-sm text-on-surface-variant flex gap-2 items-center overflow-hidden">
+        <span class="font-mono truncate" style="max-width:calc(100% - 120px);overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${esc(p.base_url||'')}</span>
+        <span class="shrink-0">·</span>
+        <span class="${keyCls} shrink-0">${keyLabel}</span>
+      </div>
+    </div>`;
+  };
+  let html = '';
+  if (presets.length) {
+    html += `<div class="text-xs uppercase tracking-wide text-on-surface-variant font-medium pt-1">Preset Providers</div>` + presets.map(card).join('');
+  }
+  if (customs.length) {
+    if (presets.length) html += `<div class="text-xs uppercase tracking-wide text-on-surface-variant font-medium pt-4">Custom Providers</div>`;
+    else html += `<div class="text-xs uppercase tracking-wide text-on-surface-variant font-medium pt-1">Custom Providers</div>`;
+    html += customs.map(card).join('');
+  }
+  if (!html) html = '<p class="text-sm text-on-surface-variant">No providers configured yet.</p>';
+  el.innerHTML = html;
+}
+async function toggleProvider(name, enabled) { const r = await api('/api/config/toggle', {method:'POST', body:JSON.stringify({name, enabled})}); if(r.ok) await loadConfig(); }
+function openProvDetail(name) {
+  const p = currentConfig.providers?.[name]; if (!p) return;
+  // keys from API are plain strings; normalize for the detail panel
+  const keys = (p.keys || []).map(k => typeof k === 'string' ? {nick: 'Key ' + ((p.keys||[]).indexOf(k)+1), value: k} : k);
+  currentProvDetail = {name, baseUrl: p.base_url||'', keys, enabled: p.enabled, accountId: p.account_id||'', apiMode: p.api_mode||'', modelLimits: p.model_limits||{}, disabledModels: p.disabled_models||[], fetchedModels: []};
+  document.getElementById('prov-detail-name').textContent = name;
+  const keyCount = keys.length;
+  const isLocal = (p.base_url||'').includes('127.0.0.1') || (p.base_url||'').includes('localhost');
+  const keyRows = keys.length > 0 ? keys.map((k,i) => {
+    const val = typeof k === 'string' ? k : (k.value || '');
+    const nick = typeof k === 'string' ? 'Key ' + (i+1) : (k.nick || ('Key ' + (i+1)));
+    return `<tr>
+      <td class="py-2 text-sm">${esc(nick)}</td>
+      <td class="py-2 text-sm font-mono">${esc(val.slice(0,3))}${val.length>7?'··':''}${esc(val.slice(-4))}</td>
+      <td class="py-2 text-right"><button onclick="removeProvKey(${i})" class="text-trend-red text-sm hover:underline">Remove</button></td>
+    </tr>`;
+  }).join('') : '<tr><td colspan="3" class="py-3 text-sm text-on-surface-variant">No keys configured.</td></tr>';
+  document.getElementById('prov-detail-body').innerHTML = `
+    <div class="border border-outline-variant rounded p-4 bg-surface-container-low flex flex-col gap-3">
+      <h3 class="text-xs uppercase text-on-surface-variant">General Configuration</h3>
+      <label class="text-sm flex flex-col gap-1">Provider Name<input value="${esc(name)}" class="border border-outline-variant bg-white rounded px-3 py-2 text-sm" readonly></label>
+      <label class="text-sm flex flex-col gap-1">Base URL<input id="prov-detail-url" value="${esc(p.base_url||'')}" class="border border-outline-variant bg-white rounded px-3 py-2 text-sm font-mono"></label>
+      <label class="text-sm flex flex-col gap-1">API Mode<span class="text-xs text-on-surface-variant">wire format the upstream speaks</span><select id="prov-detail-mode" class="border border-outline-variant bg-white rounded px-3 py-2 text-sm">
+        <option value="openai" ${(p.api_mode||'')==='openai'||(!p.api_mode)?'selected':''}>OpenAI-compatible</option>
+        <option value="anthropic" ${p.api_mode==='anthropic'?'selected':''}>Anthropic (/v1/messages)</option>
+        <option value="gemini" ${p.api_mode==='gemini'?'selected':''}>Gemini (generateContent)</option>
+      </select></label>
+      <label class="text-sm flex flex-col gap-1 ${p.account_id || (p.base_url||'').includes('{account_id}') ? '' : 'hidden'}" id="prov-account-id-label">Account ID<span class="text-xs text-on-surface-variant">Required for Cloudflare Workers AI — used to fill {account_id} in the base URL</span><input id="prov-detail-account-id" value="${esc(p.account_id||'')}" placeholder="e.g. abc123def456" class="border border-outline-variant bg-white rounded px-3 py-2 text-sm font-mono"></label>
+      <div class="flex items-center justify-between">
+        <span class="text-sm">Enabled</span>
+        <div id="prov-detail-toggle" class="toggle-sw ${p.enabled?'on':''}" onclick="toggleProvDetailEnabled()"></div>
+      </div>
+      ${isLocal ? '<p class="text-xs text-on-surface-variant">Local provider -- keys not required.</p>' : ''}
+    </div>
+    <div class="border border-outline-variant rounded p-4 bg-surface-container-low flex flex-col gap-3">
+      <div class="flex justify-between items-center">
+        <h3 class="text-xs uppercase text-on-surface-variant">API Keys (Stacks)</h3>
+        <button onclick="addProvKey()" class="text-sm text-primary hover:underline flex items-center gap-1"><span class="material-symbols-outlined text-base">add</span>Add Key</button>
+      </div>
+      <table class="w-full"><thead><tr class="text-xs uppercase text-on-surface-variant"><th class="text-left pb-2">Nickname</th><th class="text-left pb-2">Key Value</th><th class="text-right pb-2">Actions</th></tr></thead><tbody id="prov-key-tbody">${keyRows}</tbody></table>
+    </div>
+      <div id="prov-conn-status" class="text-sm text-on-surface-variant min-h-6"></div>
+    <div class="border border-outline-variant rounded p-4 bg-surface-container-low flex flex-col gap-3">
+      <div class="flex justify-between items-center">
+        <h3 class="text-xs uppercase text-on-surface-variant">Models & Routing</h3>
+        <button id="prov-fetch-models" onclick="fetchModels()" class="text-sm text-primary hover:underline flex items-center gap-1"><span class="material-symbols-outlined text-base">refresh</span>Fetch Models</button>
+      </div>
+      <div id="prov-models-list" class="flex flex-col gap-2">
+        <p class="text-sm text-on-surface-variant">Loading models…</p>
+      </div>
+    </div>`;
+  document.getElementById('prov-detail-panel').classList.add('open');
+  history.pushState({detail:'provider'}, '');
+  // load models from cache first — auto-fetch from upstream if no cache yet
+  loadProvModels(name);
+}
+function closeProvDetail() { document.getElementById('prov-detail-panel').classList.remove('open'); currentProvDetail = null; }
+// loadProvModels tries the server-side cache first (instant, no upstream call),
+// then falls back to an upstream fetch if the cache is empty. Also renders the
+// custom model input UI.
+async function loadProvModels(name) {
+  const list = document.getElementById('prov-models-list');
+  if (!list) return;
+  list.innerHTML = '<p class="text-sm text-on-surface-variant"><span class="material-symbols-outlined text-base animate-spin">progress_activity</span> Loading models…</p>';
+  try {
+    // try cache first
+    const cached = await api('/api/providers/' + encodeURIComponent(name) + '/cached-models');
+    if (cached.ok && cached.data && cached.data.data && cached.data.data.length > 0) {
+      const models = cached.data.data.map(m => ({id: m.id, source: m.source}));
+      currentProvDetail.fetchedModels = models;
+      rerenderModelList();
+      return;
+    }
+    // no cache — auto-fetch from upstream
+    const r = await api('/api/providers/' + encodeURIComponent(name) + '/models');
+    if (r.ok && r.data) {
+      const models = (r.data.data || r.data.models || []).map(m => ({id: m.id || m.name || m, source: 'fetched'})).filter(m => m.id);
+      currentProvDetail.fetchedModels = models;
+      rerenderModelList();
+      return;
+    }
+    // fetch failed and no cache — show empty state with custom model input
+    currentProvDetail.fetchedModels = [];
+    rerenderModelList();
+  } catch(e) {
+    currentProvDetail.fetchedModels = [];
+    list.innerHTML = '<p class="text-sm text-trend-red">Failed to load models: ' + esc(e.message) + '</p>';
+  }
+}
+function toggleProvDetailEnabled() {
+  document.getElementById('prov-detail-toggle').classList.toggle('on');
+  if (currentProvDetail) currentProvDetail.enabled = !currentProvDetail.enabled;
+}
+function addProvKey() {
+  const tbody = document.getElementById('prov-key-tbody');
+  const newRow = document.createElement('tr');
+  newRow.innerHTML = `
+    <td class="py-2 text-sm"><input class="border border-outline-variant bg-white rounded px-2 py-1 text-sm w-full font-mono" placeholder="nickname (optional)" data-key-nick></td>
+    <td class="py-2 text-sm"><input class="border border-outline-variant bg-white rounded px-2 py-1 text-sm w-full font-mono" placeholder="api key" data-key-value></td>
+    <td class="py-2 text-right flex gap-2 justify-end">
+      <button onclick="confirmAddProvKey(this)" class="text-sm text-primary hover:underline">Save</button>
+      <button onclick="removeProvKeyRow(this)" class="text-sm text-trend-red hover:underline">Cancel</button>
+    </td>`;
+  tbody.appendChild(newRow);
+  newRow.querySelector('[data-key-value]').focus();
+}
+function removeProvKeyRow(btn) {
+  btn.closest('tr').remove();
+}
+function confirmAddProvKey(btn) {
+  const row = btn.closest('tr');
+  const nick = row.querySelector('[data-key-nick]').value.trim() || 'Key ' + (currentProvDetail.keys.length + 1);
+  const value = row.querySelector('[data-key-value]').value.trim();
+  if (!value) { showProvToast('Please enter an API key', true); return; }
+  currentProvDetail.keys.push({nick, value, _isNew: true});
+  renderKeyTable();
+}
+function removeProvKey(i) {
+  currentProvDetail.keys.splice(i, 1);
+  renderKeyTable();
+}
+function renderKeyTable() {
+  const tbody = document.getElementById('prov-key-tbody');
+  const keys = currentProvDetail.keys;
+  tbody.innerHTML = keys.length > 0 ? keys.map((k,i) => {
+    const val = typeof k === 'string' ? k : (k.value || '');
+    const nick = typeof k === 'string' ? 'Key ' + (i+1) : (k.nick || ('Key ' + (i+1)));
+    return `<tr>
+      <td class="py-2 text-sm">${esc(nick)}</td>
+      <td class="py-2 text-sm font-mono">${esc(val.slice(0,3))}${val.length>7?'··':''}${esc(val.slice(-4))}</td>
+      <td class="py-2 text-right"><button onclick="removeProvKey(${i})" class="text-trend-red text-sm hover:underline">Remove</button></td>
+    </tr>`;
+  }).join('') : '<tr><td colspan="3" class="py-3 text-sm text-on-surface-variant">No keys configured.</td></tr>';
+}
+async function saveProvDetail() {
+  if (!currentProvDetail) return;
+  const {name, baseUrl, keys, enabled} = currentProvDetail;
+  const newUrl = document.getElementById('prov-detail-url').value.trim();
+  const newAccountId = document.getElementById('prov-detail-account-id')?.value.trim() || '';
+  const newModeEl = document.getElementById('prov-detail-mode');
+  const newMode = newModeEl ? newModeEl.value : '';
+  // update base_url, account_id, and api_mode if changed
+  if (newUrl !== baseUrl || newAccountId !== (currentProvDetail.accountId||'') || (newModeEl && newMode !== (currentProvDetail.apiMode||''))) {
+    const body = {name, base_url: newUrl, account_id: newAccountId};
+    if (newModeEl) body.api_mode = newMode;
+    await api('/api/config/providers', {method:'POST', body:JSON.stringify(body)});
+    currentProvDetail.baseUrl = newUrl;
+    currentProvDetail.accountId = newAccountId;
+    if (newModeEl) currentProvDetail.apiMode = newMode;
+  }
+  // collect keys: existing masked keys → __KEEP__ sentinel (server preserves real key),
+  // only newly-added keys (typed in this session) are sent as plaintext
+  const allKeys = [];
+  currentProvDetail.keys.forEach(k => {
+    const val = typeof k === 'string' ? k : (k.value || '');
+    if (k._isNew) {
+      // newly added key — send the real value
+      if (val) allKeys.push(val);
+    } else {
+      // existing key (masked from API) — tell server to preserve it
+      allKeys.push('__KEEP__');
+    }
+  });
+  // also collect keys from pending form input rows (not yet confirmed)
+  document.querySelectorAll('[data-key-value]').forEach(row => {
+    const val = row.value.trim();
+    if (val) allKeys.push(val);
+  });
+  await api('/api/config/keys', {method:'POST', body:JSON.stringify({name, keys: allKeys})})
+  // clear the form rows and mark keys as no longer new
+  document.querySelectorAll('[data-key-value]').forEach(row => row.closest('tr')?.remove());
+  currentProvDetail.keys.forEach(k => { if (k._isNew) k._isNew = false; });
+  currentProvDetail.keys.forEach(k => { k.value = '__KEEP__'; });
+  // update toggle if changed
+  const toggleOn = document.getElementById('prov-detail-toggle').classList.contains('on');
+  if (toggleOn !== enabled) {
+    await api('/api/config/toggle', {method:'POST', body:JSON.stringify({name, enabled: toggleOn})});
+    currentProvDetail.enabled = toggleOn;
+  }
+  showProvToast('Provider settings saved');
+  // if url or keys changed, auto-fetch models (server already triggers on save,
+  // but also refresh the model list in the panel)
+  if (newUrl !== baseUrl) {
+    loadProvModels(name);
+  }
+}
+async function testProviderConn() {
+  if (!currentProvDetail) return;
+  const btn = document.querySelector('#prov-detail-footer button');
+  if (btn) btn.disabled = true;
+  const statusEl = document.getElementById('prov-conn-status');
+  statusEl.innerHTML = '<span class="material-symbols-outlined text-base animate-spin">progress_activity</span> Testing...';
+  // gather unsaved form values to test before saving
+  const params = new URLSearchParams();
+  const formUrl = document.getElementById('prov-detail-url')?.value.trim();
+  if (formUrl && formUrl !== currentProvDetail.baseUrl) params.set('base_url', formUrl);
+  const formAcctId = document.getElementById('prov-detail-account-id')?.value.trim();
+  if (formAcctId) params.set('account_id', formAcctId);
+  // get any unsaved keys from the form (newly added or confirmed rows)
+  const unsavedKeys = document.querySelectorAll('[data-key-value]');
+  let firstKey = '';
+  if (unsavedKeys.length > 0) {
+    firstKey = unsavedKeys[0].value.trim();
+  }
+  // also check confirmed-but-unsaved keys in currentProvDetail
+  if (!firstKey && currentProvDetail.keys) {
+    const newKey = currentProvDetail.keys.find(k => k._isNew && k.value);
+    if (newKey) firstKey = newKey.value;
+  }
+  if (firstKey) params.set('key', firstKey);
+  const qs = params.toString() ? '?' + params.toString() : '';
+  // route through the router's own API to avoid CORS
+  const r = await api('/api/providers/' + encodeURIComponent(currentProvDetail.name) + '/test' + qs);
+  if (r.ok && r.data) {
+    const count = r.data.model_count || r.data.models?.length || 0;
+    statusEl.innerHTML = `<span class="material-symbols-outlined text-base text-trend-green">check_circle</span> <span class="text-sm text-trend-green">Connected. ${count} models found.</span>`;
+  } else {
+    const err = r.data?.error;
+    const errMsg = typeof err === 'string' ? err : (err?.message || 'HTTP ' + r.status);
+    statusEl.innerHTML = `<span class="material-symbols-outlined text-base text-trend-red">error</span> <span class="text-sm text-trend-red">${esc(errMsg)}</span>`;
+  }
+  if (btn) btn.disabled = false;
+}
+async function fetchModels() {
+  if (!currentProvDetail) return;
+  const btn = document.getElementById('prov-fetch-models');
+  btn.innerHTML = '<span class="material-symbols-outlined text-base animate-spin">progress_activity</span>Fetching...';
+  const list = document.getElementById('prov-models-list');
+  list.innerHTML = '<p class="text-sm text-on-surface-variant"><span class="material-symbols-outlined text-base animate-spin">progress_activity</span> Fetching models...</p>';
+  // gather unsaved form values to test before saving
+  const params = new URLSearchParams();
+  const formUrl = document.getElementById('prov-detail-url')?.value.trim();
+  if (formUrl && formUrl !== currentProvDetail.baseUrl) params.set('base_url', formUrl);
+  const formAcctId = document.getElementById('prov-detail-account-id')?.value.trim();
+  if (formAcctId) params.set('account_id', formAcctId);
+  const unsavedKeys = document.querySelectorAll('[data-key-value]');
+  let firstKey = '';
+  if (unsavedKeys.length > 0) {
+    firstKey = unsavedKeys[0].value.trim();
+  }
+  if (!firstKey && currentProvDetail.keys) {
+    const newKey = currentProvDetail.keys.find(k => k._isNew && k.value);
+    if (newKey) firstKey = newKey.value;
+  }
+  if (firstKey) params.set('key', firstKey);
+  const qs = params.toString() ? '?' + params.toString() : '';
+  // route through the router's own API to avoid CORS
+  const r = await api('/api/providers/' + encodeURIComponent(currentProvDetail.name) + '/models' + qs);
+  if (r.ok && r.data) {
+    const models = (r.data.models || r.data.data || []).map(m => ({id: m.id || m.name || m, object: m.object||'model'})).filter(m => m.id);
+    if (!models.length) {
+      list.innerHTML = '<p class="text-sm text-on-surface-variant">No models found.</p>';
+    } else {
+      currentProvDetail.fetchedModels = models;
+      list.innerHTML = models.map(m => {
+        const isDisabled = (currentProvDetail.disabledModels || []).includes(m.id);
+        const currentLimit = (currentProvDetail.modelLimits || {})[m.id] || '';
+        return `<div class="flex items-center justify-between gap-3 py-2 border-b border-outline-variant last:border-0">
+          <div class="flex items-center gap-2 min-w-0 flex-1 overflow-hidden">
+            <span class="material-symbols-outlined text-sm text-on-surface-variant">${modelIcon(m.id)}</span>
+            <span class="font-mono text-sm truncate" title="${esc(m.id)}">${esc(m.id)}</span>
+          </div>
+          <div class="flex items-center gap-2 shrink-0">
+            <input type="number" placeholder="max tokens" value="${currentLimit}" class="w-24 border border-outline-variant rounded px-2 py-1 text-xs w-20" onchange="setModelLimit('${esc(m.id)}', this.value)" title="Max tokens (blank = no limit)" />
+            <button data-action="toggleModelDisabled" data-name="${esc(m.id)}" class="px-2 py-1 text-xs rounded border ${isDisabled ? 'border-trend-red text-trend-red' : 'border-trend-green text-trend-green'}" title="${isDisabled ? 'Disabled — click to enable' : 'Enabled — click to disable'}">${isDisabled ? 'OFF' : 'ON'}</button>
+          </div>
+        </div>`;
+      }).join('') + `<div class="flex justify-between items-center pt-2"><span class="text-xs text-on-surface-variant">${models.length} models</span><button onclick="saveModelSettings()" class="bg-primary text-on-primary text-sm px-3 py-1.5 rounded hover:opacity-90">Save Model Settings</button></div>`;
+      providerModels[currentProvDetail.name] = models.map(m => m.id);
+    }
+  } else {
+    const err = r.data?.error;
+    const errMsg = typeof err === 'string' ? err : (err?.message || 'HTTP ' + r.status);
+    list.innerHTML = '<p class="text-sm text-trend-red">Failed: ' + esc(errMsg) + '</p>';
+  }
+  btn.innerHTML = '<span class="material-symbols-outlined text-base">refresh</span>Fetch Models';
+}
+function toggleModelDisabled(modelId, btn) {
+  if (!currentProvDetail) return;
+  currentProvDetail.disabledModels = currentProvDetail.disabledModels || [];
+  const idx = currentProvDetail.disabledModels.indexOf(modelId);
+  if (idx >= 0) {
+    currentProvDetail.disabledModels.splice(idx, 1);
+    btn.className = 'px-2 py-1 text-xs rounded border border-trend-green text-trend-green';
+    btn.textContent = 'ON';
+    btn.title = 'Enabled — click to disable';
+  } else {
+    currentProvDetail.disabledModels.push(modelId);
+    btn.className = 'px-2 py-1 text-xs rounded border border-trend-red text-trend-red';
+    btn.textContent = 'OFF';
+    btn.title = 'Disabled — click to enable';
+  }
+}
+function setModelLimit(modelId, value) {
+  if (!currentProvDetail) return;
+  currentProvDetail.modelLimits = currentProvDetail.modelLimits || {};
+  if (value && parseInt(value) > 0) {
+    currentProvDetail.modelLimits[modelId] = parseInt(value);
+  } else {
+    delete currentProvDetail.modelLimits[modelId];
+  }
+}
+async function saveModelSettings() {
+  if (!currentProvDetail) return;
+  const {name, modelLimits, disabledModels} = currentProvDetail;
+  try {
+    await api('/api/config/providers/' + encodeURIComponent(name), {
+      method: 'PUT',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({model_limits: modelLimits || {}, disabled_models: disabledModels || []})
+    });
+    showProvToast('Model settings saved');
+    // update currentConfig in-place so pool dropdowns pick up changes
+    if (currentConfig.providers && currentConfig.providers[name]) {
+      currentConfig.providers[name].model_limits = modelLimits || {};
+      currentConfig.providers[name].disabled_models = disabledModels || [];
+    }
+    // re-render model list with updated toggle states (don't close, don't re-fetch)
+    rerenderModelList();
+  } catch(e) {
+    showProvToast('Failed to save: ' + e.message, true);
+  }
+}
+async function addCustomModel() {
+  if (!currentProvDetail) return;
+  const input = document.getElementById('prov-custom-model-input');
+  if (!input) return;
+  const modelId = input.value.trim();
+  if (!modelId) { showProvToast('Enter a model id first', true); return; }
+  // avoid duplicates
+  if ((currentProvDetail.fetchedModels||[]).some(m => m.id === modelId)) {
+    showProvToast('Model already in list', true);
+    input.value = '';
+    return;
+  }
+  // store on server
+  const r = await api('/api/providers/' + encodeURIComponent(currentProvDetail.name) + '/custom-model', {
+    method: 'POST',
+    body: JSON.stringify({model_id: modelId})
+  });
+  if (r.ok) {
+    currentProvDetail.fetchedModels = currentProvDetail.fetchedModels || [];
+    currentProvDetail.fetchedModels.push({id: modelId, source: 'custom'});
+    input.value = '';
+    rerenderModelList();
+    showProvToast('Custom model added: ' + modelId);
+  } else {
+    showProvToast('Failed to add: ' + (r.data?.error || r.status), true);
+  }
+}
+async function removeCustomModel(modelId) {
+  if (!currentProvDetail) return;
+  const r = await api('/api/providers/' + encodeURIComponent(currentProvDetail.name) + '/custom-model', {
+    method: 'DELETE',
+    body: JSON.stringify({model_id: modelId})
+  });
+  if (r.ok) {
+    currentProvDetail.fetchedModels = (currentProvDetail.fetchedModels||[]).filter(m => m.id !== modelId);
+    rerenderModelList();
+    showProvToast('Removed: ' + modelId);
+  } else {
+    showProvToast('Failed to remove: ' + (r.data?.error || r.status), true);
+  }
+}
+function rerenderModelList() {
+  if (!currentProvDetail) return;
+  const list = document.getElementById('prov-models-list');
+  if (!list) return;
+  const models = currentProvDetail.fetchedModels || [];
+  const modelRows = models.length ? models.map(m => {
+    const isDisabled = (currentProvDetail.disabledModels || []).includes(m.id);
+    const currentLimit = (currentProvDetail.modelLimits || {})[m.id] || '';
+    const sourceBadge = m.source === 'custom'
+      ? '<span class="text-xs px-1.5 py-0.5 rounded bg-trend-green/10 text-trend-green font-mono" title="Manually added">custom</span>'
+      : '';
+    return `<div class="flex items-center justify-between gap-3 py-2 border-b border-outline-variant last:border-0">
+      <div class="flex items-center gap-2 min-w-0 flex-1 overflow-hidden">
+        <span class="material-symbols-outlined text-sm text-on-surface-variant">${modelIcon(m.id)}</span>
+        <span class="font-mono text-sm truncate" title="${esc(m.id)}">${esc(m.id)}</span>
+        ${sourceBadge}
+      </div>
+      <div class="flex items-center gap-2 shrink-0">
+        <input type="number" placeholder="max tokens" value="${currentLimit}" class="w-24 border border-outline-variant rounded px-2 py-1 text-xs w-20" onchange="setModelLimit('${esc(m.id)}', this.value)" title="Max tokens (blank = no limit)" />
+        <button data-action="toggleModelDisabled" data-name="${esc(m.id)}" class="px-2 py-1 text-xs rounded border ${isDisabled ? 'border-trend-red text-trend-red' : 'border-trend-green text-trend-green'}" title="${isDisabled ? 'Disabled — click to enable' : 'Enabled — click to disable'}">${isDisabled ? 'OFF' : 'ON'}</button>
+        ${m.source === 'custom' ? `<button onclick="removeCustomModel('${esc(m.id)}')" class="px-2 py-1 text-xs rounded text-trend-red hover:underline" title="Remove custom model"><span class="material-symbols-outlined text-sm">delete</span></button>` : ''}
+      </div>
+    </div>`;
+  }).join('') : '<p class="text-sm text-on-surface-variant py-2">No models cached. Fetch or add a custom model below.</p>';
+  list.innerHTML = modelRows + `
+    <div class="flex gap-2 items-center pt-3 border-t border-outline-variant mt-2">
+      <input id="prov-custom-model-input" type="text" maxlength="256" placeholder="custom model id (e.g. gpt-4o-mini)" class="flex-1 border border-outline-variant bg-white rounded px-3 py-1.5 text-sm font-mono" onkeydown="if(event.key==='Enter')addCustomModel()">
+      <button onclick="addCustomModel()" class="text-sm text-primary hover:underline flex items-center gap-1 whitespace-nowrap"><span class="material-symbols-outlined text-base">add</span>Add Custom Model</button>
+    </div>
+    <div class="text-xs text-on-surface-variant pt-1">For providers with broken or outdated /models endpoints.</div>
+    <div class="flex justify-between items-center pt-2">
+      <span class="text-xs text-on-surface-variant">${models.length} models</span>
+      <button onclick="saveModelSettings()" class="bg-primary text-on-primary text-sm px-3 py-1.5 rounded hover:opacity-90">Save Model Settings</button>
+    </div>`;
+}
+function modelIcon(model) {
+  model = (model||'').toLowerCase();
+  if (model.includes('gpt')||model.includes('text-')) return 'smart_toy';
+  if (model.includes('deepseek')) return 'search';
+  if (model.includes('llama')) return 'memory';
+  if (model.includes('claude')) return 'psychology';
+  if (model.includes('gemini')) return 'face';
+  if (model.includes('embed')) return 'layers';
+  if (model.includes('code')||model.includes('coder')) return 'code';
+  if (model.includes('reason')) return 'psychology';
+  return 'star';
+}
+async function editKeys(name, currentCount) {
+  // legacy — redirect to provider detail panel
+  openProvDetail(name);
+}
+async function deleteProvider(name) {
+  // inline confirm via toast — no native dialog
+  if (!window._delProvConfirm || window._delProvConfirm !== name) {
+    window._delProvConfirm = name;
+    showConfigToast('Click Delete again to confirm removal of ' + name);
+    setTimeout(() => { window._delProvConfirm = null; }, 3000);
+    return;
+  }
+  window._delProvConfirm = null;
+  const r = await api('/api/config/providers', {method:'POST', body:JSON.stringify({name, action:'delete'})});
+  if (r.ok) await loadConfig(); else showConfigToast('Delete failed: ' + (r.data?.error || r.status));
+}
+async function addProvider() {
+  const nameEl = document.getElementById('new-prov-name');
+  const urlEl = document.getElementById('new-prov-url');
+  const keysEl = document.getElementById('new-prov-keys');
+  const modeEl = document.getElementById('new-prov-mode');
+  const name = nameEl.value.trim();
+  const url = urlEl.value.trim();
+  const keys = keysEl.value.split('\n').map(k=>k.trim()).filter(Boolean);
+  const apiMode = modeEl ? modeEl.value : 'openai';
+  if (!name || !url) { showConfigToast('Need name and base_url.'); return; }
+  const btn = document.querySelector('#page-add-provider button[onclick="addProvider()"]');
+  const origText = btn.textContent;
+  btn.disabled = true;
+  btn.textContent = 'Adding...';
+  const r = await api('/api/config/providers', {method:'POST', body:JSON.stringify({name, base_url:url, keys, api_mode:apiMode})});
+  btn.disabled = false;
+  btn.textContent = origText;
+  if (r.ok) {
+    nameEl.value = '';
+    urlEl.value = '';
+    keysEl.value = '';
+    if (modeEl) modeEl.value = 'openai';
+    await loadConfig();
+    showPage('providers');
+  } else {
+    showConfigToast('Failed: ' + (typeof r.data?.error === 'string' ? r.data.error : (r.data?.error?.message || r.status)));
+  }
+}
+
+// --- playground ---
+let pgRunning = false;
+
+function initPlayground() {
+  pgUpdateEmpty();
+  pgResultsEmpty();
+}
+
+function pgUpdateEmpty() {
+  const rows = document.getElementById('pg-rows');
+  const empty = document.getElementById('pg-rows-empty');
+  if (!rows || !empty) return;
+  empty.style.display = rows.children.length ? 'none' : '';
+}
+
+function pgResultsEmpty() {
+  const res = document.getElementById('pg-results');
+  const empty = document.getElementById('pg-results-empty');
+  if (!res || !empty) return;
+  empty.style.display = res.children.length ? 'none' : '';
+}
+
+function providerOptions(selected) {
+  const provs = currentConfig.providers || {};
+  return '<option value="">Select provider</option>' + Object.keys(provs).sort().map(n =>
+    `<option value="${esc(n)}" ${n===selected?'selected':''}>${esc(n)}</option>`
+  ).join('');
+}
+
+function addPgRow() {
+  if (!currentConfig.providers || !Object.keys(currentConfig.providers).length) {
+    showConfigToast('No providers configured. Add a provider first in the Providers page.');
+    return;
+  }
+  const rows = document.getElementById('pg-rows');
+  const row = document.createElement('div');
+  row.className = 'flex flex-col md:flex-row gap-2 md:items-center border border-outline-variant rounded bg-surface-container-lowest p-2';
+  row.innerHTML = `
+    <select onchange="pgOnProviderChange(this)" class="border border-outline-variant bg-white rounded px-2 py-2 text-sm flex-1 pg-prov-sel">
+      ${providerOptions('')}
+    </select>
+    <select class="border border-outline-variant bg-white rounded px-2 py-2 text-sm flex-1 pg-model-sel" disabled>
+      <option value="">Select model</option>
+    </select>
+    <button onclick="removePgRow(this)" class="text-trend-red text-sm px-2 py-1 hover:underline self-start md:self-center whitespace-nowrap">Remove</button>
+  `;
+  rows.appendChild(row);
+  pgUpdateEmpty();
+}
+
+function removePgRow(btn) {
+  btn.closest('div.flex.flex-col').remove();
+  pgUpdateEmpty();
+}
+
+async function pgOnProviderChange(sel) {
+  const provider = sel.value;
+  const row = sel.closest('div.flex.flex-col');
+  const modelSel = row.querySelector('.pg-model-sel');
+  if (!provider) {
+    modelSel.innerHTML = '<option value="">Select model</option>';
+    modelSel.disabled = true;
+    return;
+  }
+  modelSel.innerHTML = '<option value="">loading...</option>';
+  modelSel.disabled = true;
+  try {
+    const r = await api('/api/providers/' + encodeURIComponent(provider) + '/models');
+    if (!r.ok || !r.data) { modelSel.innerHTML = '<option value="">failed to load</option>'; modelSel.disabled = true; return; }
+    const models = (r.data.models || r.data.data || []).map(m => m.id || m.name || m).filter(Boolean);
+    providerModels[provider] = models;
+    // respect disabled_models — turned-off models must not be selectable here either
+    const provConfig = (currentConfig.providers||{})[provider] || {};
+    const disabled = new Set(provConfig.disabled_models || []);
+    const available = models.filter(m => !disabled.has(m));
+    modelSel.innerHTML = '<option value="">Select model</option>' + available.map(m => `<option value="${esc(m)}">${esc(m)}</option>`).join('') + (available.length === 0 ? '<option value="">-- all models disabled --</option>' : '');
+    modelSel.disabled = false;
+  } catch(e) {
+    modelSel.innerHTML = '<option value="">connection failed</option>';
+    modelSel.disabled = true;
+  }
+}
+
+function pgGetCombos() {
+  const rows = document.querySelectorAll('#pg-rows > div');
+  const combos = [];
+  rows.forEach(row => {
+    const provider = row.querySelector('.pg-prov-sel')?.value?.trim();
+    const model = row.querySelector('.pg-model-sel')?.value?.trim();
+    if (provider && model) combos.push({provider, model});
+  });
+  return combos;
+}
+
+function pgBuildCompletionBody(prompt, provider, model, maxTokens) {
+  return {
+    model: provider + ':' + model,
+    messages: [{role: 'user', content: prompt}],
+    max_tokens: maxTokens,
+    stream: false,
+  };
+}
+
+async function pgRunOne(prompt, provider, model, maxTokens, index) {
+  const start = performance.now();
+  const result = {provider, model, index, content: '', status: 0, usage: null, latencyMs: 0, error: null};
+  try {
+    const r = await api('/v1/chat/completions', {
+      method: 'POST',
+      body: JSON.stringify(pgBuildCompletionBody(prompt, provider, model, maxTokens)),
+    });
+    result.latencyMs = Math.round(performance.now() - start);
+    result.status = r.status;
+    if (r.ok && r.data) {
+      result.content = r.data.choices?.[0]?.message?.content || r.data.choices?.[0]?.text || '';
+      result.usage = r.data.usage || null;
+    } else {
+      result.error = r.data?.error?.message || (typeof r.data === 'string' ? r.data : (r.data ? JSON.stringify(r.data) : 'HTTP ' + r.status));
+    }
+  } catch(e) {
+    result.latencyMs = Math.round(performance.now() - start);
+    result.error = e.message || 'Network error';
+  }
+  return result;
+}
+
+function pgRenderLoading(combos) {
+  const res = document.getElementById('pg-results');
+  const empty = document.getElementById('pg-results-empty');
+  empty.style.display = 'none';
+  res.innerHTML = combos.map((c, i) => `
+    <div class="border border-outline-variant rounded bg-surface-container-lowest p-4 flex flex-col gap-2" id="pg-card-${i}">
+      <div class="flex items-center justify-between">
+        <div class="flex items-center gap-2">
+          ${avatar(c.provider)}
+          <span class="font-mono text-sm">${esc(c.provider)}:${esc(c.model)}</span>
+        </div>
+        <span class="text-xs font-mono px-2 py-0.5 rounded bg-surface-container-high text-on-surface-variant">RUNNING</span>
+      </div>
+      <div class="flex items-center gap-2 text-sm text-on-surface-variant">
+        <span class="material-symbols-outlined text-base animate-spin">progress_activity</span>
+        Waiting for response...
+      </div>
+    </div>
+  `).join('');
+}
+
+function pgRenderCard(result) {
+  const ok = result.status >= 200 && result.status < 300 && !result.error;
+  const statusBadge = ok
+    ? `<span class="text-xs font-mono px-2 py-0.5 rounded bg-success-container text-success">SUCCESS</span>`
+    : `<span class="text-xs font-mono px-2 py-0.5 rounded bg-error-container text-error">ERROR</span>`;
+  const body = result.error
+    ? `<div class="text-sm text-error font-mono break-words whitespace-pre-wrap">${esc(String(result.error))}</div>`
+    : `<div class="text-sm whitespace-pre-wrap break-words">${result.content ? esc(result.content) : '<span class="text-on-surface-variant">-- empty response --</span>'}</div>`;
+  const usage = result.usage
+    ? `Prompt ${result.usage.prompt_tokens||0} · Completion ${result.usage.completion_tokens||0} · Total ${result.usage.total_tokens||((result.usage.prompt_tokens||0)+(result.usage.completion_tokens||0))}`
+    : 'Tokens: --';
+  return `
+    <div class="border border-outline-variant rounded ${ok?'bg-surface-container-lowest':'bg-error-container/20'} p-4 flex flex-col gap-2" id="pg-card-${result.index}">
+      <div class="flex items-center justify-between gap-2">
+        <div class="flex items-center gap-2 min-w-0">
+          ${avatar(result.provider)}
+          <span class="font-mono text-sm truncate">${esc(result.provider)}:${esc(result.model)}</span>
+        </div>
+        ${statusBadge}
+      </div>
+      ${body}
+      <div class="flex flex-wrap gap-3 pt-2 border-t border-outline-variant text-xs text-on-surface-variant font-mono">
+        <span class="flex items-center gap-1"><span class="material-symbols-outlined text-sm">schedule</span>${fmtMs(result.latencyMs)}</span>
+        <span class="flex items-center gap-1"><span class="material-symbols-outlined text-sm">token</span>${usage}</span>
+      </div>
+    </div>`;
+}
+
+async function runPlayground() {
+  if (pgRunning) return;
+  const prompt = document.getElementById('pg-prompt').value.trim();
+  if (!prompt) { showConfigToast('Enter a prompt first.'); return; }
+  const combos = pgGetCombos();
+  if (!combos.length) { showConfigToast('Add at least one provider+model pair.'); return; }
+  const maxTokens = parseInt(document.getElementById('pg-max-tokens').value, 10) || 100;
+  pgRunning = true;
+  const runBtn = document.getElementById('pg-run-btn');
+  runBtn.disabled = true;
+  runBtn.innerHTML = '<span class="material-symbols-outlined text-base animate-spin">progress_activity</span>Running';
+  pgRenderLoading(combos);
+  const results = await Promise.all(combos.map((c, i) => pgRunOne(prompt, c.provider, c.model, maxTokens, i)));
+  const res = document.getElementById('pg-results');
+  res.innerHTML = results.map(r => pgRenderCard(r)).join('');
+  pgResultsEmpty();
+  pgRunning = false;
+  runBtn.disabled = false;
+  runBtn.innerHTML = '<span class="material-symbols-outlined text-base">play_arrow</span>Run All';
+}
+
+// --- init ---
+async function init() {
+  // load config first so renderConfig has data
+  await loadConfig();
+  const hash = window.location.hash.slice(1);
+  const page = ['home','requests','providers','config','playground'].includes(hash) ? hash : 'home';
+  showPage(page);
+  // also load requests and stats in background
+  Promise.all([loadRequests(), loadStats()]).catch(()=>{});
+  window.addEventListener('hashchange', () => {
+    const p = window.location.hash.slice(1);
+    if (['home','requests','providers','config','playground'].includes(p)) showPage(p);
+  });
+  // re-render config if user navigates to it after initial load
+  window.addEventListener('hashchange', () => {
+    const p = window.location.hash.slice(1);
+    if (p === 'config') renderConfig();
+  });
+  // close detail panels on browser back button
+  window.addEventListener('popstate', () => {
+    if (document.getElementById('detail-panel').classList.contains('open')) closeDetail();
+    else if (document.getElementById('prov-detail-panel').classList.contains('open')) closeProvDetail();
+  });
+  // Auto-refresh the dashboard data so operators can watch the fallback chain
+  // recover in near-real-time. Polls only while the tab is visible and only
+  // refreshes the page currently in view, to avoid hammering the API in the
+  // background. On the requests page it merges new rows in without resetting
+  // the user's pagination position or filters.
+  let refreshTimer = null;
+  function scheduleRefresh() {
+    if (refreshTimer) clearInterval(refreshTimer);
+    refreshTimer = setInterval(async () => {
+      if (document.hidden) return;
+      const active = document.querySelector('.page.active')?.id;
+      try {
+        if (active === 'page-home') { await loadStats(); await refreshRequestsTop(); }
+        else if (active === 'page-requests') { await refreshRequestsTop(); }
+      } catch(e) {}
+    }, 15000);
+  }
+  document.addEventListener('visibilitychange', scheduleRefresh);
+  scheduleRefresh();
+}
+init();
+</script>
+</body>
+</html>

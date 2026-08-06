@@ -1,0 +1,42 @@
+# router.example.yaml — copy this to router.yaml and fill in your keys.
+# The router reads router.yaml at startup. Never commit the real one.
+
+db: router.db
+listen: 127.0.0.1:8015
+
+# Pick a strong random value. Every API call and dashboard request must send
+# it as a Bearer token.
+router_key: change-me
+insecure_no_auth: false
+
+# Source for the model catalog (model names, context windows, pricing).
+catalog_url: https://models.dev/api.json
+
+# The pool used when a request doesn't say which one it wants.
+default: chat
+
+pools:
+  chat:
+  - groq:llama-3.3-70b-versatile
+  - openrouter:google/gemma-4-31b-it:free
+  code:
+  - "SW:glm-5.2"
+  - nvidia-nim:z-ai/glm-5.2
+  - hypercharm:deepseek-v4-flash-0731
+  - baseten:deepseek-ai/DeepSeek-V4-Flash-0731
+
+chains: {}
+tiers: {}
+allow_direct_vision: true
+vision: []
+
+providers:
+  openrouter:
+    base_url: https://openrouter.ai/api/v1
+    keys: []
+
+  # A custom provider, OpenAI-compatible. Add api_mode: anthropic or
+  # api_mode: gemini to talk to those native APIs directly.
+  my-custom:
+    base_url: https://api.example.com/v1
+    keys: []
