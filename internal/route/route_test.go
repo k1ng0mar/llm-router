@@ -85,26 +85,29 @@ func TestFallbackAcrossKeysThenProvider(t *testing.T) {
 	}
 }
 
-func TestFourXXStopsImmediately(t *testing.T) {
-	var hits1 atomic.Int32
+func TestFourxFFFallsBack(t *testing.T) {
+	var hits1, hits2 atomic.Int32
 	s1 := stub(400, `{"error":"bad"}`, &hits1)
-	s2 := stub(200, `{"choice":"ok"}`, nil)
+	s2 := stub(200, `{"choice":"ok"}`, &hits2)
 	defer s1.Close()
 	defer s2.Close()
 
 	r, _ := testRouter(s1, s2)
 	res, err := r.Route(context.Background(), "code", map[string]any{"model": "x"}, false, false, false, 10)
-	if err == nil {
-		t.Fatal("a 4xx must surface as an error, not fall through")
+	if err != nil {
+		t.Fatalf("Route: %v", err)
 	}
-	if res == nil || res.Status != 400 {
-		t.Fatalf("status = %v, want 400", res.Status)
+	if res.Status != 200 {
+		t.Fatalf("status = %d, want 200 (should fall through)", res.Status)
 	}
-	if hits1.Load() != 1 {
-		t.Fatalf("stub1 should be hit exactly once, got %d", hits1.Load())
+	if hits1.Load() != 2 {
+		t.Fatalf("stub1 should be hit twice (k1, k2), got %d", hits1.Load())
 	}
-	if len(res.Attempts) != 1 {
-		t.Fatalf("no provider after a 4xx: got %d attempts", len(res.Attempts))
+	if hits2.Load() != 1 {
+		t.Fatalf("stub2 should be hit once, got %d", hits2.Load())
+	}
+	if len(res.Attempts) != 3 {
+		t.Fatalf("expected 3 attempts (2 keys on p1, 1 on p2), got %d", len(res.Attempts))
 	}
 }
 

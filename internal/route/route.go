@@ -195,7 +195,7 @@ func (r *Router) Route(ctx context.Context, pool string, payload map[string]any,
 			continue
 		}
 
-		baseURL, keys, enabled, modelDisabled, modelLimit, hasLimit, ok, accountID, apiMode := r.cfg.GetProviderRouting(pName, model)
+		baseURL, keys, enabled, modelDisabled, modelLimit, hasLimit, ok, accountID, apiMode, stripParams := r.cfg.GetProviderRouting(pName, model)
 		if !ok || baseURL == "" {
 			att := ap(pName, model, "", "router")
 			att.Err = "provider has no base_url"
@@ -255,6 +255,20 @@ func (r *Router) Route(ctx context.Context, pool string, payload map[string]any,
 					upstreamPayload["max_tokens"] = modelLimit
 				}
 			}
+			// strip params this provider doesn't support (e.g. groq rejects
+			// reasoning_effort). Drops them before forwarding upstream.
+			if len(stripParams) > 0 {
+				if !payloadCopied {
+					upstreamPayload = make(map[string]any, len(payload))
+					for k, v := range payload {
+						upstreamPayload[k] = v
+					}
+					payloadCopied = true
+				}
+				for _, sp := range stripParams {
+					delete(upstreamPayload, sp)
+				}
+			}
 
 			attemptCtx := ctx
 			var cancel context.CancelFunc
@@ -291,51 +305,7 @@ func (r *Router) Route(ctx context.Context, pool string, payload map[string]any,
 		att.Status = resp.StatusCode
 		var body string
 		switch {
-		case provider.Retryable(att.Status):
-			body = readErrBody(resp)
-			// capture the upstream body so operators can see *why* the attempt
-			// failed (e.g. the rate-limit / 5xx message) in the request trail.
-			att.Err = body
-			ra := parseRetryAfter(resp.Header)
-			picker.MarkFailure(keyIdx, time.Now(), ra, att.Status)
-			resp.Body.Close()
-			if cancel != nil {
-				cancel()
-			}
-			continue
-		case att.Status >= 400:
-			body = readErrBody(resp)
-			if provider.IsContextWindowError(att.Status, body) {
-				att.Err = "context window exceeded (fallback-eligible 4xx)"
-				picker.MarkFailure(keyIdx, time.Now(), 0, att.Status)
-				resp.Body.Close()
-				if cancel != nil {
-					cancel()
-				}
-				continue
-			}
-			// Upstream infrastructure 400s (e.g. General Compute's generic
-			// "Streaming request failed" marked type:"provider_error") are not
-			// client errors — treat them like 5xx and rotate to the next
-			// candidate instead of killing the chain.
-			if provider.IsProviderError(att.Status, body) {
-				att.Err = body
-				picker.MarkFailure(keyIdx, time.Now(), 0, att.Status)
-				resp.Body.Close()
-				if cancel != nil {
-					cancel()
-				}
-				continue
-			}
-			picker.MarkFailure(keyIdx, time.Now(), 0, att.Status)
-			att.Err = body
-			res.Status = att.Status
-			resp.Body.Close()
-			if cancel != nil {
-				cancel()
-			}
-			return res, fmt.Errorf("upstream %s rejected request (HTTP %d): %s", pName, att.Status, body)
-		default: // 2xx — success
+		case att.Status == 200:
 			picker.MarkSuccess(keyIdx)
 			res.Status = att.Status
 			res.Resp = resp
@@ -348,6 +318,16 @@ func (r *Router) Route(ctx context.Context, pool string, payload map[string]any,
 				res.Resp.Body = &cancelOnClose{rc: resp.Body, cancel: cancel}
 			}
 			return res, nil
+		default: // any non-200 (4xx, 5xx, 3xx) — record and fall back
+			body = readErrBody(resp)
+			att.Err = body
+			ra := parseRetryAfter(resp.Header)
+			picker.MarkFailure(keyIdx, time.Now(), ra, att.Status)
+			resp.Body.Close()
+			if cancel != nil {
+				cancel()
+			}
+			continue
 		}
 		}
 	}

@@ -41,6 +41,10 @@ type Provider struct {
 	// "anthropic", or "gemini". Non-OpenAI modes translate the request and
 	// response at the provider boundary so the router stays OpenAI-shaped.
 	APIMode string             `yaml:"api_mode"`
+	// StripParams is a list of request-body fields to drop before
+	// forwarding to this provider. Use when an upstream rejects params
+	// that other providers accept (e.g. groq rejects `reasoning_effort`).
+	StripParams []string        `yaml:"strip_params"`
 }
 
 // Providers groups provider kinds. A provider is addressed as its name:
@@ -254,13 +258,13 @@ func (c *Config) Redacted() map[string]any {
 	}
 	provs := map[string]any{}
 	if c.Providers.OpenRouter != nil {
-		provs["openrouter"] = map[string]any{"base_url": c.Providers.OpenRouter.BaseURL, "keys": maskList(c.Providers.OpenRouter.Keys, mask), "enabled": c.Providers.OpenRouter.IsEnabled(), "disabled_models": c.Providers.OpenRouter.DisabledModels, "preset": true}
+		provs["openrouter"] = map[string]any{"base_url": c.Providers.OpenRouter.BaseURL, "keys": maskList(c.Providers.OpenRouter.Keys, mask), "enabled": c.Providers.OpenRouter.IsEnabled(), "disabled_models": c.Providers.OpenRouter.DisabledModels, "strip_params": c.Providers.OpenRouter.StripParams, "preset": true}
 	}
 	if c.Providers.Ollama != nil {
-		provs["ollama"] = map[string]any{"base_url": c.Providers.Ollama.BaseURL, "keys": maskList(c.Providers.Ollama.Keys, mask), "enabled": c.Providers.Ollama.IsEnabled(), "disabled_models": c.Providers.Ollama.DisabledModels, "preset": true}
+		provs["ollama"] = map[string]any{"base_url": c.Providers.Ollama.BaseURL, "keys": maskList(c.Providers.Ollama.Keys, mask), "enabled": c.Providers.Ollama.IsEnabled(), "disabled_models": c.Providers.Ollama.DisabledModels, "strip_params": c.Providers.Ollama.StripParams, "preset": true}
 	}
 	for name, p := range c.Providers.Custom {
-		provs[name] = map[string]any{"base_url": p.BaseURL, "account_id": p.AccountID, "keys": maskList(p.Keys, mask), "enabled": p.IsEnabled(), "disabled_models": p.DisabledModels, "preset": p.Preset, "api_mode": p.APIMode}
+		provs[name] = map[string]any{"base_url": p.BaseURL, "account_id": p.AccountID, "keys": maskList(p.Keys, mask), "enabled": p.IsEnabled(), "disabled_models": p.DisabledModels, "strip_params": p.StripParams, "preset": p.Preset, "api_mode": p.APIMode}
 	}
 	heuristics := map[string][]string{}
 	for pool, kws := range c.Classifier.Heuristics {
@@ -713,12 +717,12 @@ func (c *Config) GetChain(name string) ([]string, bool) {
 // single read lock, so the hot path never reads provider fields while an admin
 // write (key rotation, toggle, model limits) is in flight. The returned keys
 // slice is used to (re)build the per-provider KeyPicker.
-func (c *Config) GetProviderRouting(name, model string) (baseURL string, keys []string, enabled, modelDisabled bool, modelLimit int, hasLimit, ok bool, accountID string, apiMode string) {
+func (c *Config) GetProviderRouting(name, model string) (baseURL string, keys []string, enabled, modelDisabled bool, modelLimit int, hasLimit, ok bool, accountID string, apiMode string, stripParams []string) {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
 	p, ok := c.Providers.Get(name)
 	if !ok || p == nil {
-		return "", nil, false, false, 0, false, false, "", ""
+		return "", nil, false, false, 0, false, false, "", "", nil
 	}
 	baseURL = p.BaseURL
 	keys = p.Keys
@@ -726,6 +730,7 @@ func (c *Config) GetProviderRouting(name, model string) (baseURL string, keys []
 	modelDisabled = p.IsModelDisabled(model)
 	accountID = p.AccountID
 	apiMode = p.APIMode
+	stripParams = p.StripParams
 	if lim, has := p.ModelLimits[model]; has {
 		modelLimit = lim
 		hasLimit = true

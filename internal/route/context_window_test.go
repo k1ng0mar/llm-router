@@ -61,8 +61,8 @@ func TestContextWindowExceededFallsThrough(t *testing.T) {
 	}
 }
 
-func TestPure4xxStopsNoFallback(t *testing.T) {
-	// 400 with an unrelated message → NOT a context-window error → terminal, no fallback
+func TestPure4xxFallsBack(t *testing.T) {
+	// 400 with an unrelated message → falls back to next provider (non-200 = fallback)
 	bad := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(400)
 		w.Write([]byte(`{"error":{"message":"bad request: missing field"}}`))
@@ -71,6 +71,7 @@ func TestPure4xxStopsNoFallback(t *testing.T) {
 
 	good := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(200)
+		w.Write([]byte(`{"choices":[{"message":{"content":"ok"}}]}`))
 	}))
 	defer good.Close()
 
@@ -87,13 +88,19 @@ func TestPure4xxStopsNoFallback(t *testing.T) {
 	r := NewRouter(cfg, g, &provider.Client{HTTP: http.DefaultClient})
 
 	res, err := r.Route(context.Background(), "chat", map[string]any{"model": "x"}, false, false, false, 500)
-	if err == nil {
-		t.Fatal("non-context-window 4xx must stop the chain")
+	if err != nil {
+		t.Fatalf("Route: %v", err)
 	}
-	if res.Status != 400 {
-		t.Fatalf("status = %d, want 400", res.Status)
+	if res.Status != 200 {
+		t.Fatalf("status = %d, want 200 (should have fallen through)", res.Status)
 	}
-	if len(res.Attempts) != 1 {
-		t.Fatalf("should NOT have tried provider b: %d attempts", len(res.Attempts))
+	if len(res.Attempts) != 2 {
+		t.Fatalf("expected 2 attempts (a failed, b ok): %d", len(res.Attempts))
+	}
+	if res.Attempts[0].Provider != "a" || res.Attempts[0].Status != 400 {
+		t.Fatalf("first attempt should be from a with 400: %+v", res.Attempts[0])
+	}
+	if res.Attempts[1].Provider != "b" || res.Attempts[1].Status != 200 {
+		t.Fatalf("second attempt should be from b with 200: %+v", res.Attempts[1])
 	}
 }
