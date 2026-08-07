@@ -56,10 +56,14 @@ type Router struct {
 	pickers map[string]*provider.KeyPicker
 }
 
-// NewRouter wires the router. client may be nil (defaults to http.DefaultClient).
+// NewRouter wires the router. client may be nil — in that case a
+// TTFB-bounded client is built from the config's timeout_s setting,
+// so per-attempt timeouts cover only the wait for response headers
+// (first token), not the full body stream.
 func NewRouter(cfg *config.Config, gate *catalog.Gate, client *provider.Client) *Router {
 	if client == nil {
-		client = &provider.Client{HTTP: http.DefaultClient}
+		ttfb := time.Duration(cfg.GetFallback().TimeoutS) * time.Second
+		client = provider.NewClientWithTTFB(ttfb)
 	}
 	return &Router{cfg: cfg, gate: gate, client: client, pickers: map[string]*provider.KeyPicker{}}
 }
@@ -270,11 +274,11 @@ func (r *Router) Route(ctx context.Context, pool string, payload map[string]any,
 				}
 			}
 
-			attemptCtx := ctx
-			var cancel context.CancelFunc
-			if attemptTimeout > 0 {
-				attemptCtx, cancel = context.WithTimeout(ctx, attemptTimeout)
-			}
+			// The per-attempt TTFB timeout is enforced at the transport
+			// level (ResponseHeaderTimeout), not via context.WithTimeout.
+			// This means once response headers arrive, the body can stream
+			// freely under the parent context — the client's own timeout
+			// governs overall request lifetime.
 			start := time.Now()
 		// Substitute per-provider templating in base_url. The supported
 		// placeholder is "{account_id}", replaced by the provider's
@@ -285,13 +289,10 @@ func (r *Router) Route(ctx context.Context, pool string, payload map[string]any,
 		if accountID != "" && strings.Contains(upBaseURL, "{account_id}") {
 			upBaseURL = strings.ReplaceAll(upBaseURL, "{account_id}", accountID)
 		}
-		resp, doErr := r.client.Do(attemptCtx, &provider.Upstream{Name: pName, BaseURL: upBaseURL, Keys: keys, APIMode: apiMode}, key, upstreamPayload)
+		resp, doErr := r.client.Do(ctx, &provider.Upstream{Name: pName, BaseURL: upBaseURL, Keys: keys, APIMode: apiMode}, key, upstreamPayload)
 		att.LatencyMs = int(time.Since(start).Milliseconds())
 
 		if doErr != nil {
-			if cancel != nil {
-				cancel()
-			}
 			picker.MarkFailure(keyIdx, time.Now(), 0, 0)
 			// Make the failure legible instead of dumping a raw
 			// `Post "...": context canceled`. Differentiate:
@@ -309,14 +310,6 @@ func (r *Router) Route(ctx context.Context, pool string, payload map[string]any,
 			picker.MarkSuccess(keyIdx)
 			res.Status = att.Status
 			res.Resp = resp
-			// Wrap the body so the per-attempt timeout context is canceled
-			// once the caller finishes reading/closing it. Previously cancel
-			// was intentionally not called on the success path (so the caller
-			// could stream the body), which leaked the timer until it fired and
-			// tripped `go vet`. cancelOnClose fixes both.
-			if cancel != nil {
-				res.Resp.Body = &cancelOnClose{rc: resp.Body, cancel: cancel}
-			}
 			return res, nil
 		default: // any non-200 (4xx, 5xx, 3xx) — record and fall back
 			body = readErrBody(resp)
@@ -324,9 +317,6 @@ func (r *Router) Route(ctx context.Context, pool string, payload map[string]any,
 			ra := parseRetryAfter(resp.Header)
 			picker.MarkFailure(keyIdx, time.Now(), ra, att.Status)
 			resp.Body.Close()
-			if cancel != nil {
-				cancel()
-			}
 			continue
 		}
 		}
@@ -395,27 +385,4 @@ func parseRetryAfter(h http.Header) time.Duration {
 		return time.Until(t)
 	}
 	return 0
-}
-
-// cancelOnClose wraps an io.ReadCloser so that the provided cancel func is
-// called exactly once when Close() is invoked. It is used by Route to defer
-// cancellation of the per-attempt timeout context until the caller has
-// finished streaming the successful upstream response body — keeping the
-// connection alive for streaming while still releasing the timer promptly.
-type cancelOnClose struct {
-	rc     io.ReadCloser
-	cancel context.CancelFunc
-	once   bool
-}
-
-func (c *cancelOnClose) Read(p []byte) (int, error) { return c.rc.Read(p) }
-func (c *cancelOnClose) Close() error {
-	err := c.rc.Close()
-	if !c.once {
-		c.once = true
-		if c.cancel != nil {
-			c.cancel()
-		}
-	}
-	return err
 }

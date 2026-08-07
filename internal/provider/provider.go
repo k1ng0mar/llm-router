@@ -26,6 +26,15 @@ func (c *Client) httpClient() *http.Client {
 	return http.DefaultClient
 }
 
+// NewClientWithTTFB creates a Client whose HTTP transport times out if
+// the upstream doesn't return response headers within ttfb. The body
+// streams freely after headers arrive — only the initial wait is bounded.
+func NewClientWithTTFB(ttfb time.Duration) *Client {
+	t := http.DefaultTransport.(*http.Transport).Clone()
+	t.ResponseHeaderTimeout = ttfb
+	return &Client{HTTP: &http.Client{Transport: t}}
+}
+
 // Upstream is one provider endpoint.
 type Upstream struct {
 	Name    string

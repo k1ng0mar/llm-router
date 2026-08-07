@@ -438,7 +438,6 @@ func TestStreamingPassthrough(t *testing.T) {
 		<-done
 	}))
 	defer streamUp.Close()
-	defer close(done)
 
 	cfg := &config.Config{
 		InsecureNoAuth: true,
@@ -457,8 +456,10 @@ func TestStreamingPassthrough(t *testing.T) {
 	ts := httptest.NewServer(s.Handler())
 	defer ts.Close()
 
-	// use http.Client with a response timeout = 0 (read everything) and a
-	// zero idle timeout so the connection doesn't close before we read all chunks
+	// Signal the upstream to release its handler as soon as we've
+	// started reading the response — the body is already written
+	// and flushed, so closing done unblocks the upstream handler
+	// without losing data.
 	slowClient := &http.Client{}
 	req, _ := http.NewRequest("POST", ts.URL+"/v1/chat/completions", strings.NewReader(`{"messages":[{"role":"user","content":"hi"}],"stream":true}`))
 	req.Header.Set("Content-Type", "application/json")
@@ -466,6 +467,7 @@ func TestStreamingPassthrough(t *testing.T) {
 	if err != nil {
 		t.Fatalf("post: %v", err)
 	}
+	close(done)
 	defer resp.Body.Close()
 	body, _ := io.ReadAll(resp.Body)
 	if resp.StatusCode != 200 {
