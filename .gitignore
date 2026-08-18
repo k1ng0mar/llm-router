@@ -1,5 +1,6 @@
 # Runtime state — never commit these
 router.yaml
+.router_key
 router.db
 router.db-shm
 router.db-wal

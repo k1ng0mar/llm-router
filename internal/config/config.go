@@ -14,6 +14,107 @@ import (
 
 const defaultCatalogURL = "https://models.dev/api.json"
 
+// Media policy values, used per model per modality. A modality left empty (or
+// set to PolicyAuto) defers to the model catalog. PolicyAllow forces the
+// modality through even when the catalog says the model can't take it — use it
+// when a model has native support the catalog under-reports. PolicyDeny
+// excludes the model from any request carrying that modality, whatever the
+// catalog claims.
+const (
+	PolicyAuto  = "auto"
+	PolicyAllow = "allow"
+	PolicyDeny  = "deny"
+)
+
+// MediaPolicy is a per-model override of catalog media capability, one value
+// per modality. The zero value defers entirely to the catalog, so a provider
+// that has never been touched behaves exactly as it did before policies existed.
+type MediaPolicy struct {
+	Image string `yaml:"image" json:"image"`
+	Audio string `yaml:"audio" json:"audio"`
+	Video string `yaml:"video" json:"video"`
+}
+
+// Stance returns this policy's value for one modality ("image", "audio",
+// "video"), normalized to PolicyAuto when unset or unrecognized. Callers can
+// switch on the result without re-checking for the empty string.
+func (m MediaPolicy) Stance(modality string) string {
+	var v string
+	switch modality {
+	case "image":
+		v = m.Image
+	case "audio":
+		v = m.Audio
+	case "video":
+		v = m.Video
+	}
+	switch v {
+	case PolicyAllow, PolicyDeny:
+		return v
+	default:
+		return PolicyAuto
+	}
+}
+
+// IsZero reports whether the policy expresses no opinion at all, so callers can
+// skip persisting or rendering it.
+func (m MediaPolicy) IsZero() bool {
+	return m.Stance("image") == PolicyAuto &&
+		m.Stance("audio") == PolicyAuto &&
+		m.Stance("video") == PolicyAuto
+}
+
+// Validate rejects unrecognized policy values so a typo in router.yaml surfaces
+// at load time rather than silently degrading to "auto" on every request.
+func (m MediaPolicy) Validate() error {
+	for _, f := range []struct{ name, val string }{{"image", m.Image}, {"audio", m.Audio}, {"video", m.Video}} {
+		switch f.val {
+		case "", PolicyAuto, PolicyAllow, PolicyDeny:
+		default:
+			return fmt.Errorf("media policy %s = %q must be one of auto, allow, deny", f.name, f.val)
+		}
+	}
+	return nil
+}
+
+// Decide resolves the policy against the modalities a request actually carries.
+// It returns the modality flags to hand the catalog gate — a modality this
+// policy explicitly allows is masked off, so the gate cannot veto it — plus a
+// non-empty reason when a modality that IS present is explicitly denied.
+// Modalities absent from the request are always false and never produce a
+// reason: denying video says nothing about a text-only request.
+func (m MediaPolicy) Decide(hasImage, hasAudio, hasVideo bool) (gateImage, gateAudio, gateVideo bool, denyReason string) {
+	one := func(present bool, modality string) (bool, string) {
+		if !present {
+			return false, ""
+		}
+		switch m.Stance(modality) {
+		case PolicyDeny:
+			return false, modality + " denied by per-model media policy"
+		case PolicyAllow:
+			return false, "" // allowed outright: don't let the catalog veto it
+		default:
+			return true, "" // auto: let the catalog decide
+		}
+	}
+	for _, c := range []struct {
+		present  bool
+		modality string
+		out      *bool
+	}{
+		{hasImage, "image", &gateImage},
+		{hasAudio, "audio", &gateAudio},
+		{hasVideo, "video", &gateVideo},
+	} {
+		flag, reason := one(c.present, c.modality)
+		if reason != "" {
+			return false, false, false, reason
+		}
+		*c.out = flag
+	}
+	return gateImage, gateAudio, gateVideo, ""
+}
+
 // Provider is one upstream endpoint with a pool of API keys.
 // Enabled controls whether the router will route to this provider. When
 // false, the provider is skipped as if it's not in any pool. This is a
@@ -45,6 +146,13 @@ type Provider struct {
 	// forwarding to this provider. Use when an upstream rejects params
 	// that other providers accept (e.g. groq rejects `reasoning_effort`).
 	StripParams []string        `yaml:"strip_params"`
+	// MediaPolicies overrides catalog media capability per model id (same
+	// keying as ModelLimits). It lets an operator force a modality through
+	// for a model the catalog under-reports, or deny one the catalog wrongly
+	// claims — which is what keeps a mixed-modality `media` pool from
+	// handing an audio request to an image-only model. Absent entries defer
+	// entirely to the catalog.
+	MediaPolicies map[string]MediaPolicy `yaml:"media_policies"`
 }
 
 // Providers groups provider kinds. A provider is addressed as its name:
@@ -113,6 +221,7 @@ func DefaultConfig() *Config {
 			"code":      {},
 			"creative":  {},
 			"reasoning": {},
+			"media":     {},
 		},
 		Chains:            map[string][]string{},
 		Tiers:             map[string][]string{},
@@ -204,6 +313,15 @@ func (c *Config) Validate() error {
 			return fmt.Errorf("vision entry %q: %w", ref, err)
 		}
 	}
+	// media policies: reject typos at load time rather than degrading to "auto"
+	// silently on every request.
+	for name, p := range c.allProvidersNoLock() {
+		for model, pol := range p.MediaPolicies {
+			if err := pol.Validate(); err != nil {
+				return fmt.Errorf("provider %q model %q: %w", name, model, err)
+			}
+		}
+	}
 	switch c.Fallback.Strategy {
 	case "round_robin", "least_used":
 	default:
@@ -224,6 +342,24 @@ func (c *Config) Validate() error {
 		}
 	}
 	return nil
+}
+
+// allProvidersNoLock returns every configured provider keyed by its routing
+// name, including the two built-ins. Caller must hold the lock.
+func (c *Config) allProvidersNoLock() map[string]*Provider {
+	out := make(map[string]*Provider, len(c.Providers.Custom)+2)
+	if c.Providers.OpenRouter != nil {
+		out["openrouter"] = c.Providers.OpenRouter
+	}
+	if c.Providers.Ollama != nil {
+		out["ollama"] = c.Providers.Ollama
+	}
+	for name, p := range c.Providers.Custom {
+		if p != nil {
+			out[name] = p
+		}
+	}
+	return out
 }
 
 // resolveNoLock is the internal resolver (caller must hold lock).
@@ -258,13 +394,13 @@ func (c *Config) Redacted() map[string]any {
 	}
 	provs := map[string]any{}
 	if c.Providers.OpenRouter != nil {
-		provs["openrouter"] = map[string]any{"base_url": c.Providers.OpenRouter.BaseURL, "keys": maskList(c.Providers.OpenRouter.Keys, mask), "enabled": c.Providers.OpenRouter.IsEnabled(), "disabled_models": c.Providers.OpenRouter.DisabledModels, "strip_params": c.Providers.OpenRouter.StripParams, "preset": true}
+		provs["openrouter"] = map[string]any{"base_url": c.Providers.OpenRouter.BaseURL, "keys": maskList(c.Providers.OpenRouter.Keys, mask), "enabled": c.Providers.OpenRouter.IsEnabled(), "disabled_models": c.Providers.OpenRouter.DisabledModels, "strip_params": c.Providers.OpenRouter.StripParams, "model_limits": c.Providers.OpenRouter.ModelLimits, "media_policies": c.Providers.OpenRouter.MediaPolicies, "preset": true}
 	}
 	if c.Providers.Ollama != nil {
-		provs["ollama"] = map[string]any{"base_url": c.Providers.Ollama.BaseURL, "keys": maskList(c.Providers.Ollama.Keys, mask), "enabled": c.Providers.Ollama.IsEnabled(), "disabled_models": c.Providers.Ollama.DisabledModels, "strip_params": c.Providers.Ollama.StripParams, "preset": true}
+		provs["ollama"] = map[string]any{"base_url": c.Providers.Ollama.BaseURL, "keys": maskList(c.Providers.Ollama.Keys, mask), "enabled": c.Providers.Ollama.IsEnabled(), "disabled_models": c.Providers.Ollama.DisabledModels, "strip_params": c.Providers.Ollama.StripParams, "model_limits": c.Providers.Ollama.ModelLimits, "media_policies": c.Providers.Ollama.MediaPolicies, "preset": true}
 	}
 	for name, p := range c.Providers.Custom {
-		provs[name] = map[string]any{"base_url": p.BaseURL, "account_id": p.AccountID, "keys": maskList(p.Keys, mask), "enabled": p.IsEnabled(), "disabled_models": p.DisabledModels, "strip_params": p.StripParams, "preset": p.Preset, "api_mode": p.APIMode}
+		provs[name] = map[string]any{"base_url": p.BaseURL, "account_id": p.AccountID, "keys": maskList(p.Keys, mask), "enabled": p.IsEnabled(), "disabled_models": p.DisabledModels, "strip_params": p.StripParams, "model_limits": p.ModelLimits, "media_policies": p.MediaPolicies, "preset": p.Preset, "api_mode": p.APIMode}
 	}
 	heuristics := map[string][]string{}
 	for pool, kws := range c.Classifier.Heuristics {
@@ -326,6 +462,15 @@ func (p *Provider) IsModelDisabled(model string) bool {
 	return false
 }
 
+// MediaPolicyFor returns the media policy for a model id. A provider or model
+// with no policy configured yields the zero policy, which defers to the catalog.
+func (p *Provider) MediaPolicyFor(model string) MediaPolicy {
+	if p == nil {
+		return MediaPolicy{}
+	}
+	return p.MediaPolicies[model]
+}
+
 // ToggleProvider enables or disables a provider by name. Persists to disk.
 func (c *Config) ToggleProvider(name string, enabled bool) error {
 	c.mu.Lock()
@@ -367,16 +512,30 @@ func (c *Config) ToggleModel(provider, model string, disabled bool) error {
 	return c.persistNoLock()
 }
 
-// SetProviderModelSettings updates model_limits and disabled_models for a provider.
-func (c *Config) SetProviderModelSettings(name string, modelLimits map[string]int, disabledModels []string) error {
+// SetProviderModelSettings updates model_limits, disabled_models and
+// media_policies for a provider. Policies that express no opinion are dropped
+// rather than persisted, so router.yaml doesn't accumulate an "auto/auto/auto"
+// entry for every model the dashboard has ever rendered.
+func (c *Config) SetProviderModelSettings(name string, modelLimits map[string]int, disabledModels []string, mediaPolicies map[string]MediaPolicy) error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	p, ok := c.Providers.Get(name)
 	if !ok {
 		return fmt.Errorf("provider %q not found", name)
 	}
+	cleaned := map[string]MediaPolicy{}
+	for model, pol := range mediaPolicies {
+		if err := pol.Validate(); err != nil {
+			return fmt.Errorf("model %q: %w", model, err)
+		}
+		if pol.IsZero() {
+			continue
+		}
+		cleaned[model] = pol
+	}
 	p.ModelLimits = modelLimits
 	p.DisabledModels = disabledModels
+	p.MediaPolicies = cleaned
 	return c.persistNoLock()
 }
 
@@ -691,6 +850,22 @@ func (c *Config) GetVision() []string {
 	return append([]string(nil), c.Vision...)
 }
 
+// GetMediaPool returns the name of the pool that serves requests carrying
+// media (images, audio, or video), or "" when none is configured. A pool named
+// "media" wins; a legacy "vision" pool is honored second so configs written
+// before audio and video were routable keep working. When this returns "",
+// callers should fall back to the default pool — the pre-media behavior.
+func (c *Config) GetMediaPool() string {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	for _, name := range []string{"media", "vision"} {
+		if entries, ok := c.Pools[name]; ok && len(entries) > 0 {
+			return name
+		}
+	}
+	return ""
+}
+
 // GetAllowDirectVision returns the allow_direct_vision flag.
 func (c *Config) GetAllowDirectVision() bool {
 	c.mu.RLock()
@@ -713,29 +888,50 @@ func (c *Config) GetChain(name string) ([]string, bool) {
 	return ch, ok
 }
 
+// ProviderRouting is the routing-relevant snapshot of one provider/model pair.
+// It exists so the hot path can take everything it needs in a single read lock
+// (see GetProviderRouting) instead of a value per call.
+type ProviderRouting struct {
+	OK            bool // false = no such provider
+	BaseURL       string
+	Keys          []string
+	Enabled       bool
+	ModelDisabled bool
+	ModelLimit    int
+	HasLimit      bool
+	AccountID     string
+	APIMode       string
+	StripParams   []string
+	MediaPolicy   MediaPolicy
+}
+
 // GetProviderRouting returns the routing-relevant fields of a provider under a
 // single read lock, so the hot path never reads provider fields while an admin
-// write (key rotation, toggle, model limits) is in flight. The returned keys
-// slice is used to (re)build the per-provider KeyPicker.
-func (c *Config) GetProviderRouting(name, model string) (baseURL string, keys []string, enabled, modelDisabled bool, modelLimit int, hasLimit, ok bool, accountID string, apiMode string, stripParams []string) {
+// write (key rotation, toggle, model limits, media policy) is in flight. The
+// returned Keys slice is used to (re)build the per-provider KeyPicker.
+func (c *Config) GetProviderRouting(name, model string) ProviderRouting {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
 	p, ok := c.Providers.Get(name)
 	if !ok || p == nil {
-		return "", nil, false, false, 0, false, false, "", "", nil
+		return ProviderRouting{}
 	}
-	baseURL = p.BaseURL
-	keys = p.Keys
-	enabled = p.IsEnabled()
-	modelDisabled = p.IsModelDisabled(model)
-	accountID = p.AccountID
-	apiMode = p.APIMode
-	stripParams = p.StripParams
+	pr := ProviderRouting{
+		OK:            true,
+		BaseURL:       p.BaseURL,
+		Keys:          p.Keys,
+		Enabled:       p.IsEnabled(),
+		ModelDisabled: p.IsModelDisabled(model),
+		AccountID:     p.AccountID,
+		APIMode:       p.APIMode,
+		StripParams:   p.StripParams,
+		MediaPolicy:   p.MediaPolicyFor(model),
+	}
 	if lim, has := p.ModelLimits[model]; has {
-		modelLimit = lim
-		hasLimit = true
+		pr.ModelLimit = lim
+		pr.HasLimit = true
 	}
-	return
+	return pr
 }
 
 // ReloadFile re-reads and re-validates the config from disk, replacing the

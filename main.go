@@ -98,7 +98,19 @@ func serve(args []string) {
 	defer st.Close()
 
 	gate := catalog.NewGate(catalog.DefaultSeed())
-	client := &provider.Client{HTTP: &http.Client{}}
+	// The one deadline the router imposes: fallback.timeout_s bounds the wait
+	// for response headers (time to first byte) on a single key. A hit rotates
+	// to the next key, then the next provider — it never fails the request on
+	// its own. Bodies stream freely once headers arrive, and there is
+	// deliberately no overall request deadline.
+	//
+	// This has to be built here. NewRouter only falls back to a bounded client
+	// when it is handed a nil one, which happens in tests and nowhere else — so
+	// passing a bare &http.Client{} meant timeout_s had no effect at all in
+	// production and a silent upstream could hang a request indefinitely.
+	ttfb := time.Duration(cfg.GetFallback().TimeoutS) * time.Second
+	client := provider.NewClientWithTTFB(ttfb)
+	log.Printf("per-attempt TTFB timeout: %s (per key; rotates to the next key/provider on expiry)", ttfb)
 	// refresh the models.dev catalog in the background; never block serving.
 	// Run the first fetch immediately on boot (so the gate has remote data
 	// right away instead of waiting a full day), then every 24h.

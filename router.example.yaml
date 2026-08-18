@@ -1,5 +1,8 @@
 # router.example.yaml — copy this to router.yaml and fill in your keys.
 # The router reads router.yaml at startup. Never commit the real one.
+#
+# `./llm-router validate --config router.example.yaml` passes as-is, so you can
+# check your edits the same way before starting the server.
 
 db: router.db
 listen: 127.0.0.1:8015
@@ -9,25 +12,43 @@ listen: 127.0.0.1:8015
 router_key: change-me
 insecure_no_auth: false
 
-# Source for the model catalog (model names, context windows, pricing).
+# Source for the model catalog (model names, context windows, capabilities).
 catalog_url: https://models.dev/api.json
 
 # The pool used when a request doesn't say which one it wants.
 default: chat
 
+# Pools are ordered fallback lists of provider:model. Every provider named here
+# must exist under `providers` below, or the config fails to load.
 pools:
   chat:
   - groq:llama-3.3-70b-versatile
   - openrouter:google/gemma-4-31b-it:free
+
   code:
-  - "SW:glm-5.2"
-  - nvidia-nim:z-ai/glm-5.2
-  - hypercharm:deepseek-v4-flash-0731
-  - baseten:deepseek-ai/DeepSeek-V4-Flash-0731
+  - openrouter:z-ai/glm-5.2
+  - my-custom:deepseek-v4-flash
+
+  # The media pool serves every non-text modality: images, audio, and video.
+  # A request carrying any of them lands here — unless a keyword heuristic or an
+  # X-Route-Pool header says otherwise — and the capability gate picks the first
+  # entry that can actually handle the modality that arrived. That makes it safe
+  # to mix single-modality models in one list: an audio request skips past the
+  # image-only entries on its own.
+  media:
+  - openrouter:nvidia/nemotron-3-nano-omni-30b-a3b-reasoning:free
+  - my-custom:some-omni-model
 
 chains: {}
 tiers: {}
+
+# When an image arrives alongside a code/reasoning signal and the target pool's
+# first model can see images, send the pixels straight there instead of running
+# the describe-first hop.
 allow_direct_vision: true
+
+# Legacy image-describe list, superseded by the `media` pool above (which wins
+# when both are set). Kept so older configs keep working.
 vision: []
 
 providers:
@@ -35,8 +56,68 @@ providers:
     base_url: https://openrouter.ai/api/v1
     keys: []
 
-  # A custom provider, OpenAI-compatible. Add api_mode: anthropic or
-  # api_mode: gemini to talk to those native APIs directly.
-  my-custom:
-    base_url: https://api.example.com/v1
-    keys: []
+  # Everything that isn't openrouter or ollama goes under `custom`.
+  custom:
+    groq:
+      base_url: https://api.groq.com/openai/v1
+      keys: []
+      # Params this upstream rejects but others accept.
+      strip_params:
+      - reasoning_effort
+
+    # An OpenAI-compatible custom provider. Set api_mode: anthropic or
+    # api_mode: gemini to talk to those native APIs directly instead.
+    my-custom:
+      base_url: https://api.example.com/v1
+      keys: []
+      api_mode: openai
+
+      # Cap max_tokens per model — an upper bound applied before the request
+      # goes upstream.
+      model_limits:
+        deepseek-v4-flash: 8192
+
+      # Per-model media overrides, one value per form: auto | allow | deny.
+      #   auto  — follow the model catalog. The default, and what every model
+      #           not listed here gets.
+      #   allow — force the form through even though the catalog says the model
+      #           can't take it. Use when you know it has native support the
+      #           catalog under-reports.
+      #   deny  — never send this form to this model, whatever the catalog says.
+      #
+      # These outrank the catalog, so they are how you keep a mixed-modality
+      # media pool honest. Editable per model in the dashboard under
+      # Providers → View Details → Models & Routing.
+      media_policies:
+        some-omni-model:
+          image: allow
+          audio: allow
+          video: deny
+
+classifier:
+  hints_first: true
+  heuristics:
+    code:
+    - 'def '
+    - 'import '
+    - 'func '
+    reasoning:
+    - 'why '
+    - 'prove'
+
+fallback:
+  # Time to first byte for ONE key — not total response time. On expiry the
+  # router moves to the next key, then the next provider; a timeout never fails
+  # the request by itself. Bodies stream freely once headers arrive, and there is
+  # no overall request deadline. Applied at startup: changing this needs a
+  # restart, not just a SIGHUP.
+  timeout_s: 90
+
+  # round_robin | least_used — how keys are picked within a provider.
+  strategy: round_robin
+
+  # How long a key sits out after a 429 with no Retry-After. Only 429 (cooldown)
+  # and 401 (dead until you rotate it) affect a key's availability; a 5xx or a
+  # timeout leaves it usable, since those describe the upstream rather than the
+  # key, and keys are shared by all of a provider's models.
+  key_cooldown_s: 60

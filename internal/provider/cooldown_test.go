@@ -92,24 +92,81 @@ func TestFourOFKeyMarkedDead(t *testing.T) {
 	}
 }
 
-func TestFiveXXShortCooldown(t *testing.T) {
-	p := NewKeyPicker("round_robin", []string{"a", "b"})
+// A 5xx describes the upstream or the model behind it, not the key. Since keys
+// are shared by every model on a provider, cooling one for a 5xx stranded that
+// provider's whole model list — so it no longer affects availability at all.
+func TestFiveXXDoesNotCoolKey(t *testing.T) {
+	p := NewKeyPicker("round_robin", []string{"a"})
 	p.SetCooldown(time.Minute)
-	p.SetShortCooldown(15 * time.Second)
 	now := time.Now()
 
 	idx, _, _ := p.Next(now)
-	p.MarkFailure(idx, now, 0, 500) // 5xx → 15s cool
+	p.MarkFailure(idx, now, 0, 500)
 
-	// 5s later key 0 should still be in cooldown (15 > 5)
-	idx2, _, _ := p.Next(now.Add(5 * time.Second))
-	if idx2 == 0 {
-		t.Fatal("5xx key should be in 15s cooldown after 5s")
+	// immediately usable again — a single-key provider must not go dark
+	idx2, key2, ok2 := p.Next(now)
+	if !ok2 || idx2 != 0 || key2 != "a" {
+		t.Fatalf("a 5xx must leave the key usable: idx=%d key=%s ok=%v", idx2, key2, ok2)
 	}
-	// 16s later key 0 usable again (short cooldown expired)
-	idx3, key3, ok3 := p.Next(now.Add(16 * time.Second))
-	if !ok3 || idx3 != 0 || key3 != "a" {
-		t.Fatalf("5xx key should be usable after 15s cool: idx=%d key=%s ok=%v", idx3, key3, ok3)
+}
+
+// Same for the other non-429, non-401 outcomes the router sees.
+func TestTransientFailuresDoNotCoolKey(t *testing.T) {
+	for _, status := range []int{0 /* transport error / TTFB timeout */, 400, 403, 404, 422, 500, 502, 503} {
+		p := NewKeyPicker("round_robin", []string{"a"})
+		p.SetCooldown(time.Minute)
+		now := time.Now()
+		idx, _, _ := p.Next(now)
+		p.MarkFailure(idx, now, 0, status)
+		if _, _, ok := p.Next(now); !ok {
+			t.Fatalf("status %d must not park the key", status)
+		}
+	}
+}
+
+// The cooldown no longer terminates a fallback loop, so the loop's bound has to
+// come from the caller: NextExcluding lets it try each key exactly once.
+func TestNextExcludingBoundsTheLoop(t *testing.T) {
+	p := NewKeyPicker("round_robin", []string{"a", "b", "c"})
+	now := time.Now()
+
+	tried := map[int]bool{}
+	var got []string
+	for {
+		idx, key, ok := p.NextExcluding(now, tried)
+		if !ok {
+			break
+		}
+		if tried[idx] {
+			t.Fatalf("NextExcluding returned an excluded key: %d", idx)
+		}
+		tried[idx] = true
+		got = append(got, key)
+		p.MarkFailure(idx, now, 0, 500) // would previously have parked it
+		if len(got) > 3 {
+			t.Fatal("loop did not terminate after every key was tried")
+		}
+	}
+	if len(got) != 3 {
+		t.Fatalf("tried %v, want all three keys exactly once", got)
+	}
+}
+
+// Exclusions stack with the real states: a dead key and a cooling key stay out.
+func TestNextExcludingRespectsDeadAndCooling(t *testing.T) {
+	p := NewKeyPicker("round_robin", []string{"a", "b", "c"})
+	p.SetCooldown(time.Minute)
+	now := time.Now()
+
+	p.MarkFailure(0, now, 0, 401) // dead
+	p.MarkFailure(1, now, 0, 429) // cooling
+	idx, key, ok := p.NextExcluding(now, nil)
+	if !ok || key != "c" || idx != 2 {
+		t.Fatalf("got idx=%d key=%s ok=%v, want the one live key (c)", idx, key, ok)
+	}
+	// now exclude the only live key too
+	if _, _, ok := p.NextExcluding(now, map[int]bool{2: true}); ok {
+		t.Fatal("no key should be available once the live one is excluded")
 	}
 }
 

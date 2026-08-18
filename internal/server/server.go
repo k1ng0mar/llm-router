@@ -75,7 +75,10 @@ func New(cfg *config.Config, st *store.Store, r *route.Router, g *catalog.Gate) 
 	if g == nil {
 		g = catalog.NewGate(nil)
 	}
-	return &Server{cfg: cfg, store: st, router: r, client: &provider.Client{HTTP: http.DefaultClient}, gate: g}
+	// The describe hop gets the same per-attempt TTFB bound as the main path;
+	// http.DefaultClient has no timeout at all.
+	ttfb := time.Duration(cfg.GetFallback().TimeoutS) * time.Second
+	return &Server{cfg: cfg, store: st, router: r, client: provider.NewClientWithTTFB(ttfb), gate: g}
 }
 
 // Handler returns the multiplexer for the whole HTTP surface.
@@ -180,56 +183,45 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
-	pool, rule, _, hasImage := classify.PoolForFullMulti(s.cfg.GetClassifierHeuristics(), messages, s.cfg.GetDefault(), hint)
-	// compute hasAudio and hasVideo by scanning messages
-	var hasAudio, hasVideo bool
-	for _, m := range messages {
-		if msg, ok := m.(map[string]any); ok {
-			if c, ok := msg["content"].([]any); ok {
-				for _, part := range c {
-					if p, ok := part.(map[string]any); ok {
-						switch p["type"] {
-						case "input_audio":
-							hasAudio = true
-						case "video_url":
-							hasVideo = true
-						}
-					}
-				}
-			}
-		}
-	}
+	// One pass decides the pool and reports every modality present. Requests
+	// carrying media and matching no keyword heuristic land in the media pool
+	// (images, audio and video alike) rather than the plain default pool.
+	pool, rule, _, media := classify.PoolForMedia(s.cfg.GetClassifierHeuristics(), messages, s.cfg.GetDefault(), hint, s.cfg.GetMediaPool())
+	hasImage, hasAudio, hasVideo := media.Image, media.Audio, media.Video
 	streaming, _ := payload["stream"].(bool)
-	// vision chain: image + code/reasoning signal → either describe pixels first
-	// (for non-vision code models) or send directly (for vision-capable code models
-	// when allow_direct_vision is enabled).
-	if hasImage && (pool == "code" || pool == "reasoning") {
-		// dual-path: if allow_direct_vision is on and the pool's first entry is
-		// vision-capable, skip the describe hop and send pixels directly.
-		if s.cfg.GetAllowDirectVision() && s.poolFirstEntryIsVision(pool, hasImage) {
-			// direct path — keep pixels, gate ensures only vision-capable models
+	// Vision chain. When an image lands in a pool whose models can't read
+	// pixels, an image-capable model describes it first and the original pool
+	// answers with that description folded into the question. Applies to any
+	// pool, not a hardcoded pair: an image in the creative pool used to 503
+	// without the hop ever being tried.
+	//
+	// Pixels are kept as-is when any of these hold:
+	//   - the target pool IS the media pool (that's where describers live)
+	//   - allow_direct_vision is on and the pool's first model can see images
+	//   - nothing image-capable is configured to describe with, in which case
+	//     the gate should have the final say rather than a synthetic 400
+	//
+	// directPath records that we sent pixels onward, so an exhausted chain can
+	// still retry via the describe hop below.
+	directPath := false
+	if hasImage {
+		canDescribe := len(s.visionRefs()) > 0
+		directOK := s.cfg.GetAllowDirectVision() && s.poolFirstEntryIsVision(pool, hasImage)
+		if pool == s.cfg.GetMediaPool() || directOK || !canDescribe {
+			directPath = canDescribe
 			if _, ok := payload["messages"]; !ok {
 				payload["messages"] = messages
 			}
 		} else {
-			// describe→code chain: extract text description, strip pixels
 			desc, err := s.describeImages(r.Context(), payload, messages)
 			if err != nil {
 				writeJSON(w, http.StatusBadRequest, map[string]any{"error": map[string]string{"message": err.Error()}})
 				return
 			}
-			// Build a new messages array with the description as a user message.
-			newMessages := []map[string]any{{"role": "user", "content": "Image description from vision pass:\n" + desc}}
-			payload["messages"] = newMessages
-			hasImage = false // pixels consumed; code model sees text only
-		}
-	} else if hasImage {
-		// image-only: keep pixels, gate will exclude non-vision candidates
-		if _, ok := payload["messages"]; !ok {
-			payload["messages"] = messages
+			payload["messages"] = describedMessages(messages, desc)
+			hasImage = false // pixels consumed; the pool sees text only
 		}
 	}
-	// no else if rewritten needed
 	if streaming {
 		payload["stream"] = true
 	}
@@ -238,6 +230,39 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 	start := time.Now()
 	minCtx := estimateTokens(payload)
 	res, err := s.router.Route(r.Context(), pool, payload, hasImage, hasAudio, hasVideo, minCtx)
+
+	// Second chance for the direct-pixel path: every pixel-capable candidate
+	// failed, but the pool may hold text-only models the gate had to exclude.
+	// Describe the image and retry the same pool as a text request rather than
+	// returning a 503 the describe hop would have avoided. The first pass's
+	// attempts are kept ahead of the retry's, so the trail shows both.
+	if err != nil && directPath && hasImage {
+		if desc, dErr := s.describeImages(r.Context(), payload, messages); dErr == nil {
+			payload["messages"] = describedMessages(messages, desc)
+			hasImage = false
+			firstPass := res.Attempts
+			// Skip the candidates whose pixel attempts just failed: as a text
+			// request they would fail the same way, and each re-tread costs a
+			// full per-attempt timeout per key. The gate-excluded candidates are
+			// deliberately NOT skipped — those text-only models are the whole
+			// point of the retry.
+			res2, err2 := s.router.RouteExcluding(r.Context(), pool, payload, false, hasAudio, hasVideo,
+				estimateTokens(payload), res.AttemptedRefs())
+			if res2 != nil {
+				// Keep both passes in the trail whether or not the retry
+				// succeeded, so a 503 still shows why the pixels failed first.
+				// The retry numbers its attempts from 1 again, so continue the
+				// sequence — otherwise the dashboard sorts the two passes into
+				// each other and the order reads as nonsense.
+				for i := range res2.Attempts {
+					res2.Attempts[i].Seq += len(firstPass)
+				}
+				res2.Attempts = append(firstPass, res2.Attempts...)
+				res, err = res2, err2
+				rule += "+described"
+			}
+		}
+	}
 
 	logReq := func(status int, prov, model string, attempts []route.Attempt, respBody string, promptTok, completionTok int) {
 		// error_origin at the request level mirrors the last attempt's origin
@@ -428,9 +453,29 @@ func sseUsageTokens(body string) (int, int) {
 	return pt, ct
 }
 
-// poolFirstEntryIsVision checks if the first entry in the pool is vision-capable
-// according to the catalog gate. Used by the dual-path vision logic to decide
-// whether to send pixels directly or go through the describe→code chain.
+// refSeesImages reports whether one "provider:model" ref can accept pixels.
+// The per-model media policy outranks the catalog: an explicit allow says the
+// operator knows the model has native image support the catalog under-reports,
+// an explicit deny keeps pixels away from it regardless of what the catalog
+// claims, and "auto" defers to the gate (which fails open for unknown models).
+func (s *Server) refSeesImages(ref string) bool {
+	prov, model, err := s.cfg.Resolve(ref)
+	if err != nil {
+		return false
+	}
+	switch s.cfg.GetProviderRouting(prov, model).MediaPolicy.Stance("image") {
+	case config.PolicyAllow:
+		return true
+	case config.PolicyDeny:
+		return false
+	}
+	ok, _ := s.gate.Check(prov+":"+model, true, false, false, 0, 0)
+	return ok
+}
+
+// poolFirstEntryIsVision checks if the first entry in the pool can take pixels.
+// Used by the dual-path vision logic to decide whether to send pixels directly
+// or go through the describe→code chain.
 func (s *Server) poolFirstEntryIsVision(pool string, hasImage bool) bool {
 	if !hasImage {
 		return false
@@ -439,25 +484,36 @@ func (s *Server) poolFirstEntryIsVision(pool string, hasImage bool) bool {
 	if len(entries) == 0 {
 		return false
 	}
-	ref := strings.TrimSpace(entries[0])
-	prov, model, err := s.cfg.Resolve(ref)
-	if err != nil {
-		return false
-	}
-	fullRef := prov + ":" + model
-	ok, _ := s.gate.Check(fullRef, true, false, false, 0, 0)
-	return ok
+	return s.refSeesImages(strings.TrimSpace(entries[0]))
 }
 
-// visionRefs returns the ordered list of vision-capable model refs to use for
-// the describe hop. The `vision:` pool is preferred; the top-level `vision:`
-// config list is the fallback (kept for configs/tests that only populate the
-// top-level list).
+// visionRefs returns the ordered list of image-capable model refs to use for the
+// describe hop, preferring the `media` pool, then a legacy `vision` pool, then
+// the top-level `vision:` list (kept for configs/tests that only populate it).
+//
+// The candidate list is filtered to refs that can actually see images. That
+// filter is what makes a single mixed-modality `media` pool safe here: the pool
+// may hold audio- or video-only models, and handing pixels to one of those would
+// waste a hop on a guaranteed failure.
 func (s *Server) visionRefs() []string {
-	if v := s.cfg.GetPools()["vision"]; len(v) > 0 {
-		return v
+	var candidates []string
+	pools := s.cfg.GetPools()
+	for _, name := range []string{"media", "vision"} {
+		if v := pools[name]; len(v) > 0 {
+			candidates = v
+			break
+		}
 	}
-	return s.cfg.GetVision()
+	if len(candidates) == 0 {
+		candidates = s.cfg.GetVision()
+	}
+	refs := make([]string, 0, len(candidates))
+	for _, ref := range candidates {
+		if ref = strings.TrimSpace(ref); ref != "" && s.refSeesImages(ref) {
+			refs = append(refs, ref)
+		}
+	}
+	return refs
 }
 
 // describeImages runs the fixed vision hop: extract a description of the
@@ -467,7 +523,7 @@ func (s *Server) visionRefs() []string {
 func (s *Server) describeImages(ctx context.Context, payload map[string]any, messages []any) (string, error) {
 	refs := s.visionRefs()
 	if len(refs) == 0 {
-		return "", errors.New("no vision model configured (set `vision:` or a `vision:` pool) for image+code requests")
+		return "", errors.New("no image-capable model configured for image+code requests (add one to the `media` pool, or set image: allow on a model whose catalog entry under-reports vision)")
 	}
 	hopMessages := append(messages, map[string]any{
 		"role":    "user",
@@ -526,6 +582,14 @@ func (s *Server) describeImages(ctx context.Context, payload map[string]any, mes
 		lastErr = errors.New("vision hop failed on all configured vision providers")
 	}
 	return "", lastErr
+}
+
+// describedMessages folds a vision-pass description into the conversation: the
+// pixels come out, every turn's text stays, and the description is attached to
+// the final user turn so the model still sees the question it is meant to answer.
+func describedMessages(messages []any, desc string) []any {
+	return classify.AppendToLastUser(classify.StripMedia(messages),
+		"\n\n[Image description from vision pass]\n"+desc)
 }
 
 func truncate(s string, n int) string {
@@ -848,8 +912,9 @@ func (s *Server) handleUpdateProvider(w http.ResponseWriter, r *http.Request) {
 	}
 	name := r.PathValue("name")
 	var body struct {
-		ModelLimits    map[string]int `json:"model_limits"`
-		DisabledModels []string       `json:"disabled_models"`
+		ModelLimits    map[string]int                 `json:"model_limits"`
+		DisabledModels []string                       `json:"disabled_models"`
+		MediaPolicies  map[string]config.MediaPolicy  `json:"media_policies"`
 	}
 	if err := json.NewDecoder(io.LimitReader(r.Body, 1<<20)).Decode(&body); err != nil {
 		writeJSON(w, http.StatusBadRequest, map[string]any{"error": err.Error()})
@@ -861,11 +926,21 @@ func (s *Server) handleUpdateProvider(w http.ResponseWriter, r *http.Request) {
 	if body.DisabledModels == nil {
 		body.DisabledModels = []string{}
 	}
-	if err := s.cfg.SetProviderModelSettings(name, body.ModelLimits, body.DisabledModels); err != nil {
+	if body.MediaPolicies == nil {
+		body.MediaPolicies = map[string]config.MediaPolicy{}
+	}
+	if err := s.cfg.SetProviderModelSettings(name, body.ModelLimits, body.DisabledModels, body.MediaPolicies); err != nil {
 		writeJSON(w, http.StatusBadRequest, map[string]any{"error": err.Error()})
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"name": name, "model_limits": body.ModelLimits, "disabled_models": body.DisabledModels})
+	// Re-read what was actually stored: zero-opinion policies are dropped
+	// rather than persisted, so echoing the request body back would tell the
+	// dashboard it saved rows that no longer exist.
+	stored := map[string]config.MediaPolicy{}
+	if p, ok := s.cfg.GetProvider(name); ok {
+		stored = p.MediaPolicies
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"name": name, "model_limits": body.ModelLimits, "disabled_models": body.DisabledModels, "media_policies": stored})
 }
 
 func (s *Server) handleSetKeys(w http.ResponseWriter, r *http.Request) {

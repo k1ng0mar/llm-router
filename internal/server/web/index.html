@@ -450,6 +450,15 @@ document.addEventListener('click', function(e) {
   }
 });
 
+// The media dropdowns live inside markup that rerenderModelList() replaces
+// wholesale, so they are handled by delegation on `change` for the same reason
+// clicks are: no inline handler ever sees a config value interpolated into JS.
+document.addEventListener('change', function(e) {
+  const sel = e.target.closest('select[data-media-model]');
+  if (!sel) return;
+  setModelMedia(sel.dataset.mediaModel, sel.dataset.mediaForm, sel.value);
+});
+
 // --- nav ---
 function showPage(name) {
   document.querySelectorAll('.page').forEach(p => p.classList.remove('active'));
@@ -1669,7 +1678,7 @@ function openProvDetail(name) {
   const p = currentConfig.providers?.[name]; if (!p) return;
   // keys from API are plain strings; normalize for the detail panel
   const keys = (p.keys || []).map(k => typeof k === 'string' ? {nick: 'Key ' + ((p.keys||[]).indexOf(k)+1), value: k} : k);
-  currentProvDetail = {name, baseUrl: p.base_url||'', keys, enabled: p.enabled, accountId: p.account_id||'', apiMode: p.api_mode||'', modelLimits: p.model_limits||{}, disabledModels: p.disabled_models||[], fetchedModels: []};
+  currentProvDetail = {name, baseUrl: p.base_url||'', keys, enabled: p.enabled, accountId: p.account_id||'', apiMode: p.api_mode||'', modelLimits: p.model_limits||{}, disabledModels: p.disabled_models||[], mediaPolicies: p.media_policies||{}, fetchedModels: []};
   document.getElementById('prov-detail-name').textContent = name;
   const keyCount = keys.length;
   const isLocal = (p.base_url||'').includes('127.0.0.1') || (p.base_url||'').includes('localhost');
@@ -1914,25 +1923,15 @@ async function fetchModels() {
   // route through the router's own API to avoid CORS
   const r = await api('/api/providers/' + encodeURIComponent(currentProvDetail.name) + '/models' + qs);
   if (r.ok && r.data) {
-    const models = (r.data.models || r.data.data || []).map(m => ({id: m.id || m.name || m, object: m.object||'model'})).filter(m => m.id);
+    const models = (r.data.models || r.data.data || []).map(m => ({id: m.id || m.name || m, source: 'fetched'})).filter(m => m.id);
     if (!models.length) {
       list.innerHTML = '<p class="text-sm text-on-surface-variant">No models found.</p>';
     } else {
+      // Render through the one renderer rather than a second copy of the row
+      // markup — the duplicate had already drifted (no media dropdowns, no
+      // source badge, no custom-model input).
       currentProvDetail.fetchedModels = models;
-      list.innerHTML = models.map(m => {
-        const isDisabled = (currentProvDetail.disabledModels || []).includes(m.id);
-        const currentLimit = (currentProvDetail.modelLimits || {})[m.id] || '';
-        return `<div class="flex items-center justify-between gap-3 py-2 border-b border-outline-variant last:border-0">
-          <div class="flex items-center gap-2 min-w-0 flex-1 overflow-hidden">
-            <span class="material-symbols-outlined text-sm text-on-surface-variant">${modelIcon(m.id)}</span>
-            <span class="font-mono text-sm truncate" title="${esc(m.id)}">${esc(m.id)}</span>
-          </div>
-          <div class="flex items-center gap-2 shrink-0">
-            <input type="number" placeholder="max tokens" value="${currentLimit}" class="w-24 border border-outline-variant rounded px-2 py-1 text-xs w-20" onchange="setModelLimit('${esc(m.id)}', this.value)" title="Max tokens (blank = no limit)" />
-            <button data-action="toggleModelDisabled" data-name="${esc(m.id)}" class="px-2 py-1 text-xs rounded border ${isDisabled ? 'border-trend-red text-trend-red' : 'border-trend-green text-trend-green'}" title="${isDisabled ? 'Disabled — click to enable' : 'Enabled — click to disable'}">${isDisabled ? 'OFF' : 'ON'}</button>
-          </div>
-        </div>`;
-      }).join('') + `<div class="flex justify-between items-center pt-2"><span class="text-xs text-on-surface-variant">${models.length} models</span><button onclick="saveModelSettings()" class="bg-primary text-on-primary text-sm px-3 py-1.5 rounded hover:opacity-90">Save Model Settings</button></div>`;
+      rerenderModelList();
       providerModels[currentProvDetail.name] = models.map(m => m.id);
     }
   } else {
@@ -1958,6 +1957,48 @@ function toggleModelDisabled(modelId, btn) {
     btn.title = 'Disabled — click to enable';
   }
 }
+// MEDIA_FORMS drives the per-model media dropdowns. Each model row gets one
+// select per form; "auto" defers to the model catalog, "allow" forces the form
+// through for a model whose catalog entry under-reports it, and "deny" excludes
+// the model from any request carrying that form. Deny is what lets a single
+// mixed-modality `media` pool skip models that can't handle what arrived.
+const MEDIA_FORMS = [
+  {key: 'image', label: 'Image', icon: 'image'},
+  {key: 'audio', label: 'Audio', icon: 'graphic_eq'},
+  {key: 'video', label: 'Video', icon: 'movie'},
+];
+function setModelMedia(modelId, form, value) {
+  if (!currentProvDetail) return;
+  currentProvDetail.mediaPolicies = currentProvDetail.mediaPolicies || {};
+  const pol = Object.assign({image:'auto', audio:'auto', video:'auto'}, currentProvDetail.mediaPolicies[modelId] || {});
+  pol[form] = value || 'auto';
+  // an all-auto policy is no policy: drop it so we don't persist noise
+  if (pol.image === 'auto' && pol.audio === 'auto' && pol.video === 'auto') {
+    delete currentProvDetail.mediaPolicies[modelId];
+  } else {
+    currentProvDetail.mediaPolicies[modelId] = pol;
+  }
+  rerenderModelList();
+}
+// mediaSelects renders the three dropdowns for one model row, colored by stance
+// so a scan down the list shows which models are forced open or shut.
+function mediaSelects(modelId) {
+  const pol = (currentProvDetail.mediaPolicies || {})[modelId] || {};
+  return MEDIA_FORMS.map(f => {
+    const v = ['allow','deny'].includes(pol[f.key]) ? pol[f.key] : 'auto';
+    const tone = v === 'allow' ? 'border-trend-green text-trend-green'
+               : v === 'deny'  ? 'border-trend-red text-trend-red'
+               : 'border-outline-variant text-on-surface-variant';
+    return `<label class="flex items-center gap-1 text-xs" title="${esc(f.label)} input for ${esc(modelId)} — auto follows the model catalog, allow forces it through, deny skips this model when ${esc(f.key)} is present">
+      <span class="material-symbols-outlined text-sm ${v === 'deny' ? 'text-trend-red' : v === 'allow' ? 'text-trend-green' : 'text-on-surface-variant'}">${f.icon}</span>
+      <select class="border rounded px-1 py-0.5 text-xs bg-white ${tone}" data-media-model="${esc(modelId)}" data-media-form="${esc(f.key)}" aria-label="${esc(f.label)} policy for ${esc(modelId)}">
+        <option value="auto" ${v==='auto'?'selected':''}>auto</option>
+        <option value="allow" ${v==='allow'?'selected':''}>allow</option>
+        <option value="deny" ${v==='deny'?'selected':''}>deny</option>
+      </select>
+    </label>`;
+  }).join('');
+}
 function setModelLimit(modelId, value) {
   if (!currentProvDetail) return;
   currentProvDetail.modelLimits = currentProvDetail.modelLimits || {};
@@ -1969,18 +2010,19 @@ function setModelLimit(modelId, value) {
 }
 async function saveModelSettings() {
   if (!currentProvDetail) return;
-  const {name, modelLimits, disabledModels} = currentProvDetail;
+  const {name, modelLimits, disabledModels, mediaPolicies} = currentProvDetail;
   try {
     await api('/api/config/providers/' + encodeURIComponent(name), {
       method: 'PUT',
       headers: {'Content-Type': 'application/json'},
-      body: JSON.stringify({model_limits: modelLimits || {}, disabled_models: disabledModels || []})
+      body: JSON.stringify({model_limits: modelLimits || {}, disabled_models: disabledModels || [], media_policies: mediaPolicies || {}})
     });
     showProvToast('Model settings saved');
     // update currentConfig in-place so pool dropdowns pick up changes
     if (currentConfig.providers && currentConfig.providers[name]) {
       currentConfig.providers[name].model_limits = modelLimits || {};
       currentConfig.providers[name].disabled_models = disabledModels || [];
+      currentConfig.providers[name].media_policies = mediaPolicies || {};
     }
     // re-render model list with updated toggle states (don't close, don't re-fetch)
     rerenderModelList();
@@ -2040,13 +2082,14 @@ function rerenderModelList() {
     const sourceBadge = m.source === 'custom'
       ? '<span class="text-xs px-1.5 py-0.5 rounded bg-trend-green/10 text-trend-green font-mono" title="Manually added">custom</span>'
       : '';
-    return `<div class="flex items-center justify-between gap-3 py-2 border-b border-outline-variant last:border-0">
+    return `<div class="flex items-center justify-between gap-3 py-2 border-b border-outline-variant last:border-0 flex-wrap">
       <div class="flex items-center gap-2 min-w-0 flex-1 overflow-hidden">
         <span class="material-symbols-outlined text-sm text-on-surface-variant">${modelIcon(m.id)}</span>
         <span class="font-mono text-sm truncate" title="${esc(m.id)}">${esc(m.id)}</span>
         ${sourceBadge}
       </div>
-      <div class="flex items-center gap-2 shrink-0">
+      <div class="flex items-center gap-2 shrink-0 flex-wrap justify-end">
+        ${mediaSelects(m.id)}
         <input type="number" placeholder="max tokens" value="${currentLimit}" class="w-24 border border-outline-variant rounded px-2 py-1 text-xs w-20" onchange="setModelLimit('${esc(m.id)}', this.value)" title="Max tokens (blank = no limit)" />
         <button data-action="toggleModelDisabled" data-name="${esc(m.id)}" class="px-2 py-1 text-xs rounded border ${isDisabled ? 'border-trend-red text-trend-red' : 'border-trend-green text-trend-green'}" title="${isDisabled ? 'Disabled — click to enable' : 'Enabled — click to disable'}">${isDisabled ? 'OFF' : 'ON'}</button>
         ${m.source === 'custom' ? `<button onclick="removeCustomModel('${esc(m.id)}')" class="px-2 py-1 text-xs rounded text-trend-red hover:underline" title="Remove custom model"><span class="material-symbols-outlined text-sm">delete</span></button>` : ''}
@@ -2059,6 +2102,13 @@ function rerenderModelList() {
       <button onclick="addCustomModel()" class="text-sm text-primary hover:underline flex items-center gap-1 whitespace-nowrap"><span class="material-symbols-outlined text-base">add</span>Add Custom Model</button>
     </div>
     <div class="text-xs text-on-surface-variant pt-1">For providers with broken or outdated /models endpoints.</div>
+    <div class="text-xs text-on-surface-variant pt-2 border-t border-outline-variant mt-2">
+      <span class="font-medium">Media forms</span> — per model, which of image / audio / video may pass through.
+      <span class="font-mono">auto</span> follows the model catalog,
+      <span class="font-mono text-trend-green">allow</span> forces the form through for a model with native support the catalog under-reports, and
+      <span class="font-mono text-trend-red">deny</span> skips the model whenever that form is present. Requests carrying media route to the
+      <span class="font-mono">media</span> pool, where these settings decide which models are eligible.
+    </div>
     <div class="flex justify-between items-center pt-2">
       <span class="text-xs text-on-surface-variant">${models.length} models</span>
       <button onclick="saveModelSettings()" class="bg-primary text-on-primary text-sm px-3 py-1.5 rounded hover:opacity-90">Save Model Settings</button>

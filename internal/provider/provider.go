@@ -201,8 +201,15 @@ const (
 // KeyPicker rotates keys with a strategy and tracks per-key state:
 //   - 401 → dead (manual rotation required)
 //   - 429 → cooldown (Retry-After honored, capped, else default)
-//   - 5xx → short cooldown (transient)
+//   - anything else (5xx, other 4xx, timeouts, transport errors) → no cooldown
 //   - success → clears transient state
+//
+// Only a rate limit or an auth failure says anything about the *key*. A 5xx or a
+// timeout describes the upstream, or the one model behind it — and keys are
+// shared by every model on a provider, so parking a key for those reasons took
+// that provider's whole model list offline because a single model was having a
+// bad minute. It also silently made the key stack the thing that ended a
+// fallback loop; that job now belongs to the caller (see NextExcluding).
 type KeyPicker struct {
 	mu            sync.Mutex
 	strategy      string
@@ -212,7 +219,6 @@ type KeyPicker struct {
 	dead          []bool
 	rr            int
 	defaultCD     time.Duration
-	shortCD       time.Duration
 	retryAfterCap time.Duration
 }
 
@@ -225,7 +231,6 @@ func NewKeyPicker(strategy string, keys []string) *KeyPicker {
 		failUntil:     make([]time.Time, len(keys)),
 		dead:          make([]bool, len(keys)),
 		defaultCD:     60 * time.Second,
-		shortCD:       15 * time.Second,
 		retryAfterCap: 300 * time.Second,
 	}
 }
@@ -233,21 +238,29 @@ func NewKeyPicker(strategy string, keys []string) *KeyPicker {
 // SetCooldown overrides the default 429 cooldown duration.
 func (p *KeyPicker) SetCooldown(d time.Duration) { p.defaultCD = d }
 
-// SetShortCooldown overrides the default 5xx short cooldown.
-func (p *KeyPicker) SetShortCooldown(d time.Duration) { p.shortCD = d }
-
 // SetRetryAfterCap caps how long a Retry-After value can keep a key down.
 func (p *KeyPicker) SetRetryAfterCap(d time.Duration) { p.retryAfterCap = d }
 
 // Next returns the next eligible key index. ok=false when all keys are dead/cooling.
 func (p *KeyPicker) Next(now time.Time) (int, string, bool) {
+	return p.NextExcluding(now, nil)
+}
+
+// NextExcluding is Next with a set of key indices to skip. ok=false when every
+// key is dead, cooling, or excluded.
+//
+// A caller driving a fallback loop should pass the keys it has already tried for
+// the current candidate. That bounds the loop at one attempt per key no matter
+// what the cooldown policy does, so termination never depends on a failure
+// having parked the key — which is what it used to depend on.
+func (p *KeyPicker) NextExcluding(now time.Time, skip map[int]bool) (int, string, bool) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	if len(p.keys) == 0 {
 		return 0, "", false
 	}
 	usable := func(i int) bool {
-		if p.dead[i] {
+		if p.dead[i] || skip[i] {
 			return false
 		}
 		return now.After(p.failUntil[i]) || p.failUntil[i].IsZero()
@@ -282,11 +295,16 @@ func (p *KeyPicker) Next(now time.Time) (int, string, bool) {
 	}
 }
 
-// MarkFailure records a failed attempt on index. status determines the
-// cooldown behavior:
+// MarkFailure records a failed attempt on index. Only two statuses affect the
+// key's availability:
 //   - 401 → key is marked dead (manual reset required)
 //   - 429 → cooldown = retryAfter (if > 0, capped at retryAfterCap), else defaultCD
-//   - other (5xx) → shortCD (transient)
+//
+// Every other outcome — 5xx, other 4xx, a TTFB timeout, a transport error — is
+// recorded for usage accounting and nothing more. Those describe the upstream or
+// the model, not the key, and keys are per provider: cooling one would strand
+// every other model that provider serves. See the KeyPicker type comment.
+//
 // retryAfter is ignored for non-429 statuses.
 func (p *KeyPicker) MarkFailure(idx int, now time.Time, retryAfter time.Duration, status int) {
 	p.mu.Lock()
@@ -296,26 +314,20 @@ func (p *KeyPicker) MarkFailure(idx int, now time.Time, retryAfter time.Duration
 	}
 	p.usage[idx]++
 
-	if status == 401 {
+	switch status {
+	case 401:
 		p.dead[idx] = true
 		p.failUntil[idx] = time.Time{} // dead, not just cooling
-		return
-	}
-
-	var cd time.Duration
-	if status == 429 {
+	case 429:
+		cd := p.defaultCD
 		if retryAfter > 0 {
 			cd = retryAfter
 			if cd > p.retryAfterCap {
 				cd = p.retryAfterCap
 			}
-		} else {
-			cd = p.defaultCD
 		}
-	} else {
-		cd = p.shortCD
+		p.failUntil[idx] = now.Add(cd)
 	}
-	p.failUntil[idx] = now.Add(cd)
 }
 
 // MarkSuccess records a successful use (counts toward least_used balance).

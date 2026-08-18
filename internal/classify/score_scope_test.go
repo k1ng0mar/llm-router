@@ -11,7 +11,7 @@ func TestScoresOnlyLastUserTurn(t *testing.T) {
 		map[string]any{"role": "developer", "content": "you must always be thorough. why is everything the way it is."},
 		map[string]any{"role": "user", "content": "def parse(json):\n    import os"},
 	}
-	pool, rule, text, _ := PoolForFullMulti(h, msgs, "chat", "")
+	pool, rule, text, _ := PoolForMedia(h, msgs, "chat", "", "")
 	if pool != "code" {
 		t.Fatalf("should classify to code from last user turn, not reasoning from preamble; got pool=%q", pool)
 	}
@@ -29,7 +29,7 @@ func TestStripsAgentInjectedWrappers(t *testing.T) {
 	msgs := []any{
 		map[string]any{"role": "user", "content": "<system-reminder>import antigravity</system-reminder>\n<env>TOKEN=bearer</env>\nactually, can you help me?"},
 	}
-	pool, _, text, _ := PoolForFullMulti(h, msgs, "chat", "")
+	pool, _, text, _ := PoolForMedia(h, msgs, "chat", "", "")
 	// the <system-reminder> contains "import " which would trigger code heuristics
 	// — it must be stripped so we don't misroute to code
 	if pool == "code" {
@@ -48,9 +48,9 @@ func TestMultiPartUserTurnTextExtracted(t *testing.T) {
 			map[string]any{"type": "image_url", "image_url": map[string]any{"url": "https://x.png"}},
 		}},
 	}
-	pool, rule, text, hasImage := PoolForFullMulti(h, msgs, "default", "")
-	if hasImage != true {
-		t.Fatal("image_url part must set hasImage")
+	pool, rule, text, media := PoolForMedia(h, msgs, "default", "", "")
+	if !media.Image {
+		t.Fatal("image_url part must set media.Image")
 	}
 	if pool != "code" && rule != "code-heuristic" {
 		t.Fatalf("text part with 'import' should classify to code: pool=%q rule=%q", pool, rule)
@@ -66,9 +66,9 @@ func TestNoUserTurnFallsToDefault(t *testing.T) {
 		map[string]any{"role": "system", "content": "import a module"},
 		map[string]any{"role": "user", "content": "hi there"},
 	}
-	pool, rule, text, hasImage := PoolForFullMulti(h, msgs, "chat", "")
-	if pool != "chat" || rule != "default" || text != "hi there" || hasImage {
-		t.Fatalf("system turn must be skipped; got pool=%q rule=%q text=%q hasImage=%v", pool, rule, text, hasImage)
+	pool, rule, text, media := PoolForMedia(h, msgs, "chat", "", "")
+	if pool != "chat" || rule != "default" || text != "hi there" || media.Any() {
+		t.Fatalf("system turn must be skipped; got pool=%q rule=%q text=%q media=%+v", pool, rule, text, media)
 	}
 }
 
