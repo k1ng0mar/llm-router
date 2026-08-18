@@ -717,10 +717,23 @@ function renderRequests() {
     </div>`;
 }
 
-function openDetail(id) {
+async function openDetail(id) {
   const r = allRequests.find(x => x.id === id); if (!r) return;
   currentDetail = r;
   document.getElementById('detail-id').textContent = r.id;
+  // The list endpoint strips request/response bodies so it stays small (a few
+  // hundred requests used to arrive as ~76MB of JSON, which is what made the
+  // Recent Requests and Requests pages unusable). Load the full row — bodies
+  // included — on demand for the detail panel.
+  if (!r.request_body && !r.response_body) {
+    const d = await api('/api/requests/' + encodeURIComponent(id));
+    if (d.ok && d.data) {
+      r.request_body = d.data.request_body || '';
+      r.response_body = d.data.response_body || '';
+      if (d.data.attempts) r.attempts = d.data.attempts;
+      if (d.data.error_origin) r.error_origin = d.data.error_origin;
+    }
+  }
   const body = document.getElementById('detail-body');
   const atts = r.attempts || [];
   const isExcluded = a => a.status === 0 && (a.err||'').startsWith('excluded');

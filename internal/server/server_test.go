@@ -19,6 +19,132 @@ import (
 	"llm-router/internal/store"
 )
 
+func TestUnmatchedAPIPathsReturnJSONNotDashboard(t *testing.T) {
+	h := newHarness(t, "")
+	defer h.close()
+
+	// GET on a known POST-only endpoint: 405 JSON, not dashboard HTML.
+	resp, err := http.Get(h.srv.URL + "/v1/chat/completions")
+	if err != nil {
+		t.Fatalf("GET chat completions: %v", err)
+	}
+	b, _ := io.ReadAll(resp.Body)
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusMethodNotAllowed {
+		t.Fatalf("GET /v1/chat/completions: status %d, want 405 (body: %s)", resp.StatusCode, b)
+	}
+	if ct := resp.Header.Get("Content-Type"); !strings.Contains(ct, "application/json") {
+		t.Fatalf("GET /v1/chat/completions: Content-Type = %q, want JSON", ct)
+	}
+	var e struct {
+		Error map[string]any `json:"error"`
+	}
+	if err := json.Unmarshal(b, &e); err != nil || e.Error == nil {
+		t.Fatalf("GET /v1/chat/completions: expected JSON error body, got %q", b)
+	}
+
+	// Unknown /v1/* and /api/* paths: 404 JSON.
+	for _, path := range []string{"/v1/does-not-exist", "/api/does-not-exist", "/api/requests/not-a-real-id"} {
+		resp, err := http.Get(h.srv.URL + path)
+		if err != nil {
+			t.Fatalf("GET %s: %v", path, err)
+		}
+		bb, _ := io.ReadAll(resp.Body)
+		resp.Body.Close()
+		if resp.StatusCode != http.StatusNotFound {
+			t.Fatalf("GET %s: status %d, want 404 (body: %s)", path, resp.StatusCode, bb)
+		}
+		if ct := resp.Header.Get("Content-Type"); !strings.Contains(ct, "application/json") {
+			t.Fatalf("GET %s: Content-Type = %q, want JSON", path, ct)
+		}
+	}
+
+	// The dashboard itself is still served at / with HTML.
+	resp, _ = http.Get(h.srv.URL + "/")
+	b, _ = io.ReadAll(resp.Body)
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusOK || !strings.Contains(resp.Header.Get("Content-Type"), "text/html") {
+		t.Fatalf("GET /: status %d ct %q, want 200 text/html", resp.StatusCode, resp.Header.Get("Content-Type"))
+	}
+	if !strings.Contains(string(b), "LLM Router") {
+		t.Fatalf("GET /: dashboard HTML not served")
+	}
+}
+
+func TestRequestListStripsBodiesAndDetailHasThem(t *testing.T) {
+	h := newHarness(t, "")
+	defer h.close()
+
+	resp, body := post(t, h.srv.URL+"/v1/chat/completions", "", `{"model":"any","messages":[{"role":"user","content":"hello detail body test"}]}`, nil)
+	if resp.StatusCode != 200 {
+		t.Fatalf("chat: status %d body %s", resp.StatusCode, body)
+	}
+
+	rows, _ := h.store.ListRequests(store.Filter{Limit: 5}, 0)
+	if len(rows) != 1 {
+		t.Fatalf("expected 1 logged request, got %d", len(rows))
+	}
+	id := rows[0].ID
+
+	getJSON := func(path string, v any) int {
+		r, err := http.Get(h.srv.URL + path)
+		if err != nil {
+			t.Fatalf("GET %s: %v", path, err)
+		}
+		defer r.Body.Close()
+		if err := json.NewDecoder(r.Body).Decode(v); err != nil {
+			t.Fatalf("decode %s: %v", path, err)
+		}
+		return r.StatusCode
+	}
+
+	// The list endpoint strips request/response bodies by default so paging the
+	// event log stays small (a few hundred requests used to arrive as ~76MB).
+	var list struct {
+		Data []map[string]any `json:"data"`
+	}
+	if st := getJSON("/api/requests?limit=10", &list); st != 200 {
+		t.Fatalf("list status %d", st)
+	}
+	if len(list.Data) != 1 {
+		t.Fatalf("list: expected 1 row, got %d", len(list.Data))
+	}
+	if _, has := list.Data[0]["request_body"]; has {
+		t.Fatal("list response must strip request_body")
+	}
+	if _, has := list.Data[0]["response_body"]; has {
+		t.Fatal("list response must strip response_body")
+	}
+
+	// GET /api/requests/{id} returns the full row with bodies for the detail panel.
+	var det map[string]any
+	if st := getJSON("/api/requests/"+id, &det); st != 200 {
+		t.Fatalf("detail status %d", st)
+	}
+	reqBody, _ := det["request_body"].(string)
+	if !strings.Contains(reqBody, "hello detail body test") {
+		t.Fatalf("detail request_body should carry the payload, got %q", reqBody)
+	}
+	respBody, _ := det["response_body"].(string)
+	if !strings.Contains(respBody, "chat-response") {
+		t.Fatalf("detail response_body should carry the upstream response, got %q", respBody)
+	}
+
+	// include_bodies=true on the list opts back in.
+	var ilist struct {
+		Data []map[string]any `json:"data"`
+	}
+	if st := getJSON("/api/requests?include_bodies=true", &ilist); st != 200 {
+		t.Fatalf("include_bodies list status %d", st)
+	}
+	if _, has := ilist.Data[0]["request_body"]; !has {
+		t.Fatal("include_bodies=true list must include request_body")
+	}
+	if _, has := ilist.Data[0]["response_body"]; !has {
+		t.Fatal("include_bodies=true list must include response_body")
+	}
+}
+
 func TestVendorEmbeddedAndServed(t *testing.T) {
 	// Sanity: the vendored assets are actually embedded at compile time.
 	for want := range map[string]bool{

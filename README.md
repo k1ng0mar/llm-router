@@ -158,9 +158,16 @@ Do not put this behind `tailscale funnel`. Funnel publishes to the open internet
 | `GET /v1/models` | Lists the routable model names: `router`, `auto`, and every pool. OpenAI-compatible, so a client's model picker offers real routing choices. |
 | `GET /healthz` | Health check. |
 | `GET /` | Dashboard. |
+| `GET /api/requests` | Request log, newest first. Supports `limit` (≤500), `offset`, `pool`, `status`, `request_id`. **Bodies are stripped by default** so the list stays small — pass `include_bodies=true` (or `1`) to embed each row's `request_body`/`response_body`. |
+| `GET /api/requests/{id}` | One request with its attempts and full request/response bodies — what the dashboard's detail panel loads when you click a row. |
 | `GET /api/config` | Read config (providers, pools). |
 | `POST /api/config/providers` | Add, update, or delete a provider. |
 | `PUT /api/config/providers/{name}` | Update a provider's model limits, disabled models, and media policies. |
+
+Unknown `GET`s under `/v1/` or `/api/` return JSON (`404`, or `405` for a known
+endpoint hit with the wrong method, e.g. `GET` on the POST-only chat endpoint)
+rather than the dashboard HTML, so an OpenAI-compatible client probing those
+paths sees a real API error instead of parsing a web page.
 
 ## Running it properly
 

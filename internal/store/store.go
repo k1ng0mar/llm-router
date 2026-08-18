@@ -221,13 +221,21 @@ func (s *Store) AddAttempt(a *AttemptRow) error {
 }
 
 // ListRequests returns requests matching the filter, newest first, with attempts.
-func (s *Store) ListRequests(f Filter, _ int) ([]RequestWithAttempts, error) {
+// withBodies != 0 also loads each request's request_body and response_body. The
+// dashboard list is served with withBodies == 0 so paging the (potentially long)
+// event log does not drag megabytes of body text across the wire; the request
+// detail panel loads the full row separately.
+func (s *Store) ListRequests(f Filter, withBodies int) ([]RequestWithAttempts, error) {
 	limit := f.Limit
 	if limit <= 0 {
 		limit = 50
 	}
 	offset := f.Offset
-	q := `SELECT id, ts, pool, rule, final_status, final_provider, final_model, prompt_tokens, completion_tokens, cost, total_ms, error_origin, request_body, response_body
+	q := `SELECT id, ts, pool, rule, final_status, final_provider, final_model, prompt_tokens, completion_tokens, cost, total_ms, error_origin`
+	if withBodies != 0 {
+		q += `, request_body, response_body`
+	}
+	q += `
       FROM requests WHERE 1=1`
 	args := []any{}
 	if f.Pool != "" {
@@ -254,8 +262,14 @@ func (s *Store) ListRequests(f Filter, _ int) ([]RequestWithAttempts, error) {
 	var ids []string
 	for rows.Next() {
 		var r RequestWithAttempts
-		if err := rows.Scan(&r.ID, &r.TS, &r.Pool, &r.Rule, &r.FinalStatus, &r.FinalProvider, &r.FinalModel, &r.PromptTokens, &r.CompletionTok, &r.Cost, &r.TotalMs, &r.ErrorOrigin, &r.RequestBody, &r.ResponseBody); err != nil {
-			return nil, err
+		if withBodies != 0 {
+			if err := rows.Scan(&r.ID, &r.TS, &r.Pool, &r.Rule, &r.FinalStatus, &r.FinalProvider, &r.FinalModel, &r.PromptTokens, &r.CompletionTok, &r.Cost, &r.TotalMs, &r.ErrorOrigin, &r.RequestBody, &r.ResponseBody); err != nil {
+				return nil, err
+			}
+		} else {
+			if err := rows.Scan(&r.ID, &r.TS, &r.Pool, &r.Rule, &r.FinalStatus, &r.FinalProvider, &r.FinalModel, &r.PromptTokens, &r.CompletionTok, &r.Cost, &r.TotalMs, &r.ErrorOrigin); err != nil {
+				return nil, err
+			}
 		}
 		ids = append(ids, r.ID)
 		out = append(out, r)
@@ -275,6 +289,20 @@ func (s *Store) ListRequests(f Filter, _ int) ([]RequestWithAttempts, error) {
 		out[i].Attempts = attMap[out[i].ID]
 	}
 	return out, nil
+}
+
+// GetRequest returns one request with its attempts and full bodies, or nil when
+// no such request exists. Used by the dashboard detail panel, which fetches the
+// list without bodies and then loads the full row on demand.
+func (s *Store) GetRequest(id string) (*RequestWithAttempts, error) {
+	rows, err := s.ListRequests(Filter{RequestID: id, Limit: 1}, 1)
+	if err != nil {
+		return nil, err
+	}
+	if len(rows) == 0 {
+		return nil, nil
+	}
+	return &rows[0], nil
 }
 
 // CountRequests returns the total number of requests matching the filter.

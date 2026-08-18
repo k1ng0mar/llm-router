@@ -89,6 +89,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /healthz", s.handleHealthz)
 	mux.HandleFunc("GET /v1/models", s.handleListModels)
 	mux.HandleFunc("GET /api/requests", s.handleRequests)
+	mux.HandleFunc("GET /api/requests/{id}", s.handleRequestDetail)
 	mux.HandleFunc("GET /api/stats", s.handleStats)
 	mux.HandleFunc("GET /api/usage/models", s.handleModelUsage)
 	mux.HandleFunc("GET /api/config", s.handleGetConfig)
@@ -109,6 +110,19 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("POST /api/providers/{name}/custom-model", s.handleAddCustomModel)
 	mux.HandleFunc("DELETE /api/providers/{name}/custom-model", s.handleRemoveCustomModel)
 	mux.HandleFunc("GET /api/providers/{name}/test", s.handleProviderTest)
+	// Catch-alls for the API namespaces. Without these, an unmatched request
+	// under /v1/ or /api/ falls through to the `GET /` dashboard catch-all
+	// below and an OpenAI-compatible client's probe receives 200 text/html
+	// instead of a JSON error — GET /v1/chat/completions was exactly that.
+	// Registered routes are more specific and always win. A known path hit with
+	// the wrong method (e.g. GET on the POST-only chat endpoint) lands on the
+	// /v1/ catch-all, which turns it into a 405 (handleOpenAPIUnknown).
+	mux.HandleFunc("GET /v1/", s.handleOpenAPIUnknown)
+	mux.HandleFunc("POST /v1/", s.handleOpenAPIUnknown)
+	mux.HandleFunc("GET /api/", s.handleAdminUnknown)
+	mux.HandleFunc("POST /api/", s.handleAdminUnknown)
+	mux.HandleFunc("PUT /api/", s.handleAdminUnknown)
+	mux.HandleFunc("DELETE /api/", s.handleAdminUnknown)
 	mux.HandleFunc("GET /", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "text/html; charset=utf-8")
 		io.WriteString(w, dashboardHTML)
@@ -187,6 +201,34 @@ func writeJSON(w http.ResponseWriter, status int, v any) {
 	if err := json.NewEncoder(w).Encode(v); err != nil {
 		log.Printf("writeJSON: %v", err)
 	}
+}
+
+// v1EndpointMethods maps the known OpenAI endpoints to the method they accept.
+// Because the catch-alls are registered with method prefixes (a method-less
+// /v1/ would conflict with the GET / dashboard catch-all), the mux can't answer
+// a wrong-method call on a known endpoint by itself — a GET /v1/chat/completions
+// lands here matching GET /v1/. This table turns that into a 405.
+var v1EndpointMethods = map[string]string{
+	"/v1/chat/completions": http.MethodPost,
+	"/v1/models":           http.MethodGet,
+}
+
+// handleOpenAPIUnknown answers any /v1/* path that is not a registered route:
+// 405 for a known endpoint hit with the wrong method (e.g. GET on the POST-only
+// chat endpoint), 404 otherwise. Either way the caller gets JSON, not the
+// dashboard HTML the `GET /` catch-all would otherwise serve.
+func (s *Server) handleOpenAPIUnknown(w http.ResponseWriter, r *http.Request) {
+	if m, ok := v1EndpointMethods[r.URL.Path]; ok && r.Method != m {
+		writeJSON(w, http.StatusMethodNotAllowed, map[string]any{"error": map[string]string{"message": "method not allowed, expected " + m}})
+		return
+	}
+	writeJSON(w, http.StatusNotFound, map[string]any{"error": map[string]string{"message": "not found"}})
+}
+
+// handleAdminUnknown answers unknown /api/* paths with a JSON 404 instead of
+// the dashboard HTML (see handleOpenAPIUnknown).
+func (s *Server) handleAdminUnknown(w http.ResponseWriter, r *http.Request) {
+	writeJSON(w, http.StatusNotFound, map[string]any{"error": map[string]string{"message": "not found"}})
 }
 
 // handleChat is the OpenAI-compatible entry point.
@@ -814,6 +856,46 @@ func (s *Server) handleModelUsage(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, rows)
 }
 
+// attDTO and reqDTO are the JSON shapes for the request list/detail endpoints.
+// RequestBody/ResponseBody use omitempty so the list response (which strips
+// them by default) stays small — the detail endpoint carries the full bodies.
+type attDTO struct {
+	Seq         int    `json:"seq"`
+	Provider    string `json:"provider"`
+	Model       string `json:"model"`
+	KeyID       string `json:"key_id"`
+	Status      int    `json:"status"`
+	LatencyMs   int    `json:"latency_ms"`
+	Err         string `json:"err"`
+	ErrorOrigin string `json:"error_origin"`
+}
+
+type reqDTO struct {
+	ID               string   `json:"id"`
+	TS               string   `json:"ts"`
+	Pool             string   `json:"pool"`
+	Rule             string   `json:"rule"`
+	FinalStatus      int      `json:"final_status"`
+	FinalProvider    string   `json:"final_provider"`
+	FinalModel       string   `json:"final_model"`
+	PromptTokens     int      `json:"prompt_tokens"`
+	CompletionTokens int      `json:"completion_tokens"`
+	Cost             float64  `json:"cost"`
+	TotalMs          int      `json:"total_ms"`
+	ErrorOrigin      string   `json:"error_origin"`
+	RequestBody      string   `json:"request_body,omitempty"`
+	ResponseBody     string   `json:"response_body,omitempty"`
+	Attempts         []attDTO `json:"attempts"`
+}
+
+func toRequestDTO(x store.RequestWithAttempts) reqDTO {
+	d := reqDTO{ID: x.ID, TS: x.TS, Pool: x.Pool, Rule: x.Rule, FinalStatus: x.FinalStatus, FinalProvider: x.FinalProvider, FinalModel: x.FinalModel, PromptTokens: x.PromptTokens, CompletionTokens: x.CompletionTok, Cost: x.Cost, TotalMs: x.TotalMs, ErrorOrigin: x.ErrorOrigin, RequestBody: x.RequestBody, ResponseBody: x.ResponseBody}
+	for _, a := range x.Attempts {
+		d.Attempts = append(d.Attempts, attDTO{Seq: a.Seq, Provider: a.Provider, Model: a.Model, KeyID: a.KeyID, Status: a.Status, LatencyMs: a.LatencyMs, Err: a.Err, ErrorOrigin: a.ErrorOrigin})
+	}
+	return d
+}
+
 func (s *Server) handleRequests(w http.ResponseWriter, r *http.Request) {
 	if !s.authorized(r) {
 		writeJSON(w, http.StatusUnauthorized, map[string]any{"error": map[string]string{"message": "unauthorized"}})
@@ -836,48 +918,53 @@ func (s *Server) handleRequests(w http.ResponseWriter, r *http.Request) {
 			f.Offset = n
 		}
 	}
-	rows, err := s.store.ListRequests(f, 0)
+	// Bodies are stripped unless explicitly asked for. Each row can carry up to
+	// maxStoredBody of request+response text, so the default list response for a
+	// few hundred requests ran to ~76MB and made the dashboard's Recent Requests
+	// and Requests pages unusable. The detail endpoint loads bodies on demand.
+	includeBodies := q.Get("include_bodies") == "1" || q.Get("include_bodies") == "true"
+	rows, err := s.store.ListRequests(f, boolInt(includeBodies))
 	if err != nil {
 		writeJSON(w, http.StatusInternalServerError, map[string]any{"error": err.Error()})
 		return
 	}
-	type attDTO struct {
-		Seq         int    `json:"seq"`
-		Provider    string `json:"provider"`
-		Model       string `json:"model"`
-		KeyID       string `json:"key_id"`
-		Status      int    `json:"status"`
-		LatencyMs   int    `json:"latency_ms"`
-		Err         string `json:"err"`
-		ErrorOrigin string `json:"error_origin"`
-	}
-	type reqDTO struct {
-		ID               string   `json:"id"`
-		TS               string   `json:"ts"`
-		Pool             string   `json:"pool"`
-		Rule             string   `json:"rule"`
-		FinalStatus      int      `json:"final_status"`
-		FinalProvider    string   `json:"final_provider"`
-		FinalModel       string   `json:"final_model"`
-		PromptTokens     int      `json:"prompt_tokens"`
-		CompletionTokens int      `json:"completion_tokens"`
-		Cost             float64  `json:"cost"`
-		TotalMs          int      `json:"total_ms"`
-		ErrorOrigin      string   `json:"error_origin"`
-		RequestBody      string   `json:"request_body"`
-		ResponseBody     string   `json:"response_body"`
-		Attempts         []attDTO `json:"attempts"`
-	}
 	out := make([]reqDTO, 0, len(rows))
 	for _, x := range rows {
-		d := reqDTO{ID: x.ID, TS: x.TS, Pool: x.Pool, Rule: x.Rule, FinalStatus: x.FinalStatus, FinalProvider: x.FinalProvider, FinalModel: x.FinalModel, PromptTokens: x.PromptTokens, CompletionTokens: x.CompletionTok, Cost: x.Cost, TotalMs: x.TotalMs, ErrorOrigin: x.ErrorOrigin, RequestBody: x.RequestBody, ResponseBody: x.ResponseBody}
-		for _, a := range x.Attempts {
-			d.Attempts = append(d.Attempts, attDTO{Seq: a.Seq, Provider: a.Provider, Model: a.Model, KeyID: a.KeyID, Status: a.Status, LatencyMs: a.LatencyMs, Err: a.Err, ErrorOrigin: a.ErrorOrigin})
-		}
-		out = append(out, d)
+		out = append(out, toRequestDTO(x))
 	}
 	total, _ := s.store.CountRequests(store.Filter{Pool: q.Get("pool"), Status: f.Status, RequestID: q.Get("request_id")})
 	writeJSON(w, http.StatusOK, map[string]any{"data": out, "total": total})
+}
+
+// handleRequestDetail returns one request with its attempts and full bodies —
+// the counterpart to the body-less list rows the dashboard pages over.
+func (s *Server) handleRequestDetail(w http.ResponseWriter, r *http.Request) {
+	if !s.authorized(r) {
+		writeJSON(w, http.StatusUnauthorized, map[string]any{"error": map[string]string{"message": "unauthorized"}})
+		return
+	}
+	id := r.PathValue("id")
+	if id == "" {
+		writeJSON(w, http.StatusBadRequest, map[string]any{"error": map[string]string{"message": "request id required"}})
+		return
+	}
+	req, err := s.store.GetRequest(id)
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]any{"error": err.Error()})
+		return
+	}
+	if req == nil {
+		writeJSON(w, http.StatusNotFound, map[string]any{"error": map[string]string{"message": "request not found"}})
+		return
+	}
+	writeJSON(w, http.StatusOK, toRequestDTO(*req))
+}
+
+func boolInt(b bool) int {
+	if b {
+		return 1
+	}
+	return 0
 }
 
 func (s *Server) handleGetConfig(w http.ResponseWriter, r *http.Request) {
