@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"sync"
@@ -127,30 +128,39 @@ func (m MediaPolicy) Decide(hasImage, hasAudio, hasVideo bool) (gateImage, gateA
 // ModelLimits optionally caps max_tokens per model id, applied as an
 // upper bound before the request is sent upstream.
 type Provider struct {
-	BaseURL string           `yaml:"base_url"`
-	Keys    []string         `yaml:"keys"`
-	Enabled *bool            `yaml:"enabled"` // pointer so "nil" = enabled (default), false = disabled
+	BaseURL     string         `yaml:"base_url"`
+	Keys        []string       `yaml:"keys"`
+	Enabled     *bool          `yaml:"enabled"` // pointer so "nil" = enabled (default), false = disabled
 	ModelLimits map[string]int `yaml:"model_limits"`
 	// AccountID is an opaque per-provider identifier (e.g. a Cloudflare
 	// account id) substituted into base_url at request time via the
 	// "{account_id}" placeholder. Empty means no substitution.
-	AccountID string          `yaml:"account_id"`
+	AccountID string `yaml:"account_id"`
 	// DisabledModels is a list of model ids that should be skipped during
 	// candidate selection even when the provider is enabled. This allows
 	// per-model disable without disabling the whole provider.
-	DisabledModels []string  `yaml:"disabled_models"`
+	DisabledModels []string `yaml:"disabled_models"`
 	// Preset marks a provider as a built-in/preset entry in the dashboard
 	// (shown in the "Preset Providers" group). Custom providers added via the
 	// API default to false and appear under "Custom Providers".
-	Preset bool               `yaml:"preset"`
+	Preset bool `yaml:"preset"`
 	// APIMode selects the upstream wire format: "openai" (default),
 	// "anthropic", or "gemini". Non-OpenAI modes translate the request and
 	// response at the provider boundary so the router stays OpenAI-shaped.
-	APIMode string             `yaml:"api_mode"`
+	APIMode string `yaml:"api_mode"`
 	// StripParams is a list of request-body fields to drop before
 	// forwarding to this provider. Use when an upstream rejects params
 	// that other providers accept (e.g. groq rejects `reasoning_effort`).
-	StripParams []string        `yaml:"strip_params"`
+	StripParams []string `yaml:"strip_params"`
+	// RepairReasoningContent applies to DeepSeek-family gateways (e.g.
+	// TokenRouter) that reject a conversation history where an assistant
+	// message carrying tool_calls lacks a non-empty `reasoning_content`
+	// field, answering 400 "reasoning_content is required for thinking
+	// tool-call history". OpenAI-compatible clients routinely drop that
+	// field when building follow-up requests. When enabled, the router
+	// injects a placeholder before forwarding so the request round-trips
+	// instead of bouncing.
+	RepairReasoningContent bool `yaml:"repair_reasoning_content"`
 	// KeyLabels are operator-chosen nicknames for the entries in Keys, aligned
 	// by index ("prod", "billing account", "burner"). Purely descriptive — the
 	// router never routes on them — but with several interchangeable keys on one
@@ -199,26 +209,45 @@ type FallbackCfg struct {
 	TimeoutS     int    `yaml:"timeout_s"`
 	Strategy     string `yaml:"strategy"`
 	KeyCooldownS int    `yaml:"key_cooldown_s"`
+	// ProviderCooldownS is the circuit-breaker window: after a provider:model
+	// candidate fails with a transport error or 5xx, it is skipped (recorded as
+	// an "excluded" attempt) for this many seconds instead of being re-dialed at
+	// the front of the pool on every request. 0 disables it. Guards against a
+	// dead upstream silently adding its full per-attempt timeout to every
+	// request in a pool.
+	ProviderCooldownS int `yaml:"provider_cooldown_s"`
+	// ProviderFailureThreshold is how many *consecutive* hard failures a
+	// provider:model candidate may take before the short cooldown escalates to
+	// ProviderLockoutS. The streak survives the short cooldown expiring — that
+	// is what lets a persistently dead upstream escalate instead of being
+	// re-probed every minute forever — and only a 200 resets it. 0 disables
+	// escalation, leaving every failure on the short cooldown.
+	ProviderFailureThreshold int `yaml:"provider_failure_threshold"`
+	// ProviderLockoutS is the escalated cooldown applied once a candidate has
+	// failed ProviderFailureThreshold times in a row. Named "lockout" rather
+	// than "timeout" because timeout_s already means something else here (the
+	// per-attempt TTFB deadline). 0 disables escalation.
+	ProviderLockoutS int `yaml:"provider_lockout_s"`
 }
 
 // Config is the whole router configuration.
 type Config struct {
 	mu                sync.RWMutex
-	Path              string             `yaml:"-"`
-	DBPath            string             `yaml:"db"`
-	Listen            string             `yaml:"listen"`
-	RouterKey         string             `yaml:"router_key"`
-	InsecureNoAuth    bool               `yaml:"insecure_no_auth"`
-	CatalogURL        string             `yaml:"catalog_url"`
-	Default           string             `yaml:"default"`
+	Path              string              `yaml:"-"`
+	DBPath            string              `yaml:"db"`
+	Listen            string              `yaml:"listen"`
+	RouterKey         string              `yaml:"router_key"`
+	InsecureNoAuth    bool                `yaml:"insecure_no_auth"`
+	CatalogURL        string              `yaml:"catalog_url"`
+	Default           string              `yaml:"default"`
 	Pools             map[string][]string `yaml:"pools"`
 	Chains            map[string][]string `yaml:"chains"`
 	Tiers             map[string][]string `yaml:"tiers"`
-	AllowDirectVision bool               `yaml:"allow_direct_vision"`
-	Vision            []string           `yaml:"vision"`
-	Providers         Providers          `yaml:"providers"`
-	Classifier        ClassifierCfg      `yaml:"classifier"`
-	Fallback          FallbackCfg        `yaml:"fallback"`
+	AllowDirectVision bool                `yaml:"allow_direct_vision"`
+	Vision            []string            `yaml:"vision"`
+	Providers         Providers           `yaml:"providers"`
+	Classifier        ClassifierCfg       `yaml:"classifier"`
+	Fallback          FallbackCfg         `yaml:"fallback"`
 }
 
 // DefaultConfig returns a sane starting config.
@@ -238,7 +267,7 @@ func DefaultConfig() *Config {
 		Chains:            map[string][]string{},
 		Tiers:             map[string][]string{},
 		AllowDirectVision: true,
-		Providers: Providers{Custom: map[string]*Provider{}},
+		Providers:         Providers{Custom: map[string]*Provider{}},
 		Classifier: ClassifierCfg{
 			HintsFirst: true,
 			Heuristics: map[string][]string{
@@ -246,7 +275,10 @@ func DefaultConfig() *Config {
 				"reasoning": {"why ", "explain the tradeoffs", "prove", "plan the"},
 			},
 		},
-		Fallback: FallbackCfg{TimeoutS: 90, Strategy: "round_robin", KeyCooldownS: 60},
+		Fallback: FallbackCfg{
+			TimeoutS: 90, Strategy: "round_robin", KeyCooldownS: 60,
+			ProviderCooldownS: 60, ProviderFailureThreshold: 5, ProviderLockoutS: 600,
+		},
 	}
 }
 
@@ -406,27 +438,27 @@ func (c *Config) Redacted() map[string]any {
 	}
 	provs := map[string]any{}
 	if c.Providers.OpenRouter != nil {
-		provs["openrouter"] = map[string]any{"base_url": c.Providers.OpenRouter.BaseURL, "keys": maskList(c.Providers.OpenRouter.Keys, mask), "enabled": c.Providers.OpenRouter.IsEnabled(), "disabled_models": c.Providers.OpenRouter.DisabledModels, "strip_params": c.Providers.OpenRouter.StripParams, "key_labels": c.Providers.OpenRouter.KeyLabels, "model_limits": c.Providers.OpenRouter.ModelLimits, "media_policies": c.Providers.OpenRouter.MediaPolicies, "preset": true}
+		provs["openrouter"] = map[string]any{"base_url": c.Providers.OpenRouter.BaseURL, "keys": maskList(c.Providers.OpenRouter.Keys, mask), "enabled": c.Providers.OpenRouter.IsEnabled(), "disabled_models": c.Providers.OpenRouter.DisabledModels, "strip_params": c.Providers.OpenRouter.StripParams, "key_labels": c.Providers.OpenRouter.KeyLabels, "model_limits": c.Providers.OpenRouter.ModelLimits, "media_policies": c.Providers.OpenRouter.MediaPolicies, "repair_reasoning_content": c.Providers.OpenRouter.RepairReasoningContent, "preset": true}
 	}
 	if c.Providers.Ollama != nil {
-		provs["ollama"] = map[string]any{"base_url": c.Providers.Ollama.BaseURL, "keys": maskList(c.Providers.Ollama.Keys, mask), "enabled": c.Providers.Ollama.IsEnabled(), "disabled_models": c.Providers.Ollama.DisabledModels, "strip_params": c.Providers.Ollama.StripParams, "key_labels": c.Providers.Ollama.KeyLabels, "model_limits": c.Providers.Ollama.ModelLimits, "media_policies": c.Providers.Ollama.MediaPolicies, "preset": true}
+		provs["ollama"] = map[string]any{"base_url": c.Providers.Ollama.BaseURL, "keys": maskList(c.Providers.Ollama.Keys, mask), "enabled": c.Providers.Ollama.IsEnabled(), "disabled_models": c.Providers.Ollama.DisabledModels, "strip_params": c.Providers.Ollama.StripParams, "key_labels": c.Providers.Ollama.KeyLabels, "model_limits": c.Providers.Ollama.ModelLimits, "media_policies": c.Providers.Ollama.MediaPolicies, "repair_reasoning_content": c.Providers.Ollama.RepairReasoningContent, "preset": true}
 	}
 	for name, p := range c.Providers.Custom {
-		provs[name] = map[string]any{"base_url": p.BaseURL, "account_id": p.AccountID, "keys": maskList(p.Keys, mask), "enabled": p.IsEnabled(), "disabled_models": p.DisabledModels, "strip_params": p.StripParams, "key_labels": p.KeyLabels, "model_limits": p.ModelLimits, "media_policies": p.MediaPolicies, "preset": p.Preset, "api_mode": p.APIMode}
+		provs[name] = map[string]any{"base_url": p.BaseURL, "account_id": p.AccountID, "keys": maskList(p.Keys, mask), "enabled": p.IsEnabled(), "disabled_models": p.DisabledModels, "strip_params": p.StripParams, "key_labels": p.KeyLabels, "model_limits": p.ModelLimits, "media_policies": p.MediaPolicies, "repair_reasoning_content": p.RepairReasoningContent, "preset": p.Preset, "api_mode": p.APIMode}
 	}
 	heuristics := map[string][]string{}
 	for pool, kws := range c.Classifier.Heuristics {
 		heuristics[pool] = kws
 	}
 	return map[string]any{
-		"default":      c.Default,
-		"pools":        c.Pools,
-		"chains":       c.Chains,
-		"tiers":        c.Tiers,
-		"vision":       c.Vision,
-		"providers":    provs,
-		"classifier":   map[string]any{"heuristics": heuristics},
-		"fallback":     map[string]any{"timeout_s": c.Fallback.TimeoutS, "strategy": c.Fallback.Strategy, "key_cooldown_s": c.Fallback.KeyCooldownS},
+		"default":    c.Default,
+		"pools":      c.Pools,
+		"chains":     c.Chains,
+		"tiers":      c.Tiers,
+		"vision":     c.Vision,
+		"providers":  provs,
+		"classifier": map[string]any{"heuristics": heuristics},
+		"fallback":   map[string]any{"timeout_s": c.Fallback.TimeoutS, "strategy": c.Fallback.Strategy, "key_cooldown_s": c.Fallback.KeyCooldownS, "provider_cooldown_s": c.Fallback.ProviderCooldownS, "provider_failure_threshold": c.Fallback.ProviderFailureThreshold, "provider_lockout_s": c.Fallback.ProviderLockoutS},
 	}
 }
 
@@ -551,6 +583,15 @@ func (c *Config) SetProviderModelSettings(name string, modelLimits map[string]in
 	return c.persistNoLock()
 }
 
+// persistNoLock writes the config to disk atomically: the new YAML goes to a
+// temp file in the same directory, is fsynced, and is then renamed over the
+// target, so a reader never observes a half-written file and a crash mid-save
+// leaves the old config intact. The previous contents are kept alongside as
+// "<path>.bak" first.
+//
+// The care is warranted: this file holds every provider API key, and a plain
+// in-place truncate-and-write that fails partway destroys credentials that
+// exist nowhere else.
 func (c *Config) persistNoLock() error {
 	if c.Path == "" {
 		return nil
@@ -559,7 +600,33 @@ func (c *Config) persistNoLock() error {
 	if err != nil {
 		return err
 	}
-	return os.WriteFile(c.Path, out, 0o600)
+	// Best effort: a backup we could not write must not block a valid save.
+	if prev, rerr := os.ReadFile(c.Path); rerr == nil && len(prev) > 0 {
+		_ = os.WriteFile(c.Path+".bak", prev, 0o600)
+	}
+	tmp, err := os.CreateTemp(filepath.Dir(c.Path), ".router-config-*.yaml")
+	if err != nil {
+		return err
+	}
+	tmpName := tmp.Name()
+	// No-op once the rename below succeeds; on any early return it cleans up.
+	defer os.Remove(tmpName)
+	if err := tmp.Chmod(0o600); err != nil {
+		tmp.Close()
+		return err
+	}
+	if _, err := tmp.Write(out); err != nil {
+		tmp.Close()
+		return err
+	}
+	if err := tmp.Sync(); err != nil {
+		tmp.Close()
+		return err
+	}
+	if err := tmp.Close(); err != nil {
+		return err
+	}
+	return os.Rename(tmpName, c.Path)
 }
 
 // SetDefault records a new default pool in memory and on disk.
@@ -944,17 +1011,18 @@ func (c *Config) GetChain(name string) ([]string, bool) {
 // It exists so the hot path can take everything it needs in a single read lock
 // (see GetProviderRouting) instead of a value per call.
 type ProviderRouting struct {
-	OK            bool // false = no such provider
-	BaseURL       string
-	Keys          []string
-	Enabled       bool
-	ModelDisabled bool
-	ModelLimit    int
-	HasLimit      bool
-	AccountID     string
-	APIMode       string
-	StripParams   []string
-	MediaPolicy   MediaPolicy
+	OK                     bool // false = no such provider
+	BaseURL                string
+	Keys                   []string
+	Enabled                bool
+	ModelDisabled          bool
+	ModelLimit             int
+	HasLimit               bool
+	AccountID              string
+	APIMode                string
+	StripParams            []string
+	RepairReasoningContent bool
+	MediaPolicy            MediaPolicy
 }
 
 // GetProviderRouting returns the routing-relevant fields of a provider under a
@@ -969,15 +1037,16 @@ func (c *Config) GetProviderRouting(name, model string) ProviderRouting {
 		return ProviderRouting{}
 	}
 	pr := ProviderRouting{
-		OK:            true,
-		BaseURL:       p.BaseURL,
-		Keys:          p.Keys,
-		Enabled:       p.IsEnabled(),
-		ModelDisabled: p.IsModelDisabled(model),
-		AccountID:     p.AccountID,
-		APIMode:       p.APIMode,
-		StripParams:   p.StripParams,
-		MediaPolicy:   p.MediaPolicyFor(model),
+		OK:                     true,
+		BaseURL:                p.BaseURL,
+		Keys:                   p.Keys,
+		Enabled:                p.IsEnabled(),
+		ModelDisabled:          p.IsModelDisabled(model),
+		AccountID:              p.AccountID,
+		APIMode:                p.APIMode,
+		StripParams:            p.StripParams,
+		RepairReasoningContent: p.RepairReasoningContent,
+		MediaPolicy:            p.MediaPolicyFor(model),
 	}
 	if lim, has := p.ModelLimits[model]; has {
 		pr.ModelLimit = lim

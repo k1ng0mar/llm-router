@@ -53,6 +53,7 @@ Everything lives in `router.yaml`. Copy `router.example.yaml` for a starting poi
   - `account_id` — fills an `{account_id}` placeholder in `base_url` (used by Cloudflare Workers AI).
   - `model_limits` — per-model `max_tokens` cap, applied as an upper bound.
   - `strip_params` — request fields to drop before forwarding (e.g. groq rejects `reasoning_effort`).
+  - `repair_reasoning_content` — for DeepSeek-family gateways (TokenRouter) that answer `400 messages[N].reasoning_content is required for thinking tool-call history`. OpenAI-compatible clients drop `reasoning_content` when they build a follow-up request, because it isn't in the OpenAI schema, so every multi-turn tool conversation dies on the second hop. With this on, the router puts a placeholder back into any assistant message that carries `tool_calls` without it. Off by default; harmless on providers that ignore the field.
   - `media_policies` — per-model media overrides. See below.
 - **`chains`** / **`tiers`** — advanced routing rules. Leave empty unless you need them.
 
@@ -65,6 +66,28 @@ Anything that isn't text — images, audio, video — is "media", and it all tak
 If you have no `media` pool, media-carrying requests fall to the default pool, exactly as they did before. A pool named `vision` is honored as a fallback so older configs keep working.
 
 **Which model takes it.** Detection spans the whole conversation, not just the last turn — an image three turns back still has to be decodable by whoever answers now. The gate then excludes every candidate that can't handle the forms present, so you can put image-only, audio-only, and video-only models in one `media` pool and let each request find its own match. If nothing in the pool can handle it, you get a 503 with the exclusions recorded, not a request forwarded to a model that would choke on it.
+
+### Where capabilities come from
+
+The gate's facts come from the model catalog at `catalog_url` (models.dev by
+default), refreshed at startup and merged over a small hand-verified seed. The
+router reads each model's `modalities.input` to set image/audio/video support,
+`tool_call` for tool use, and `limit.context` for the context window — roughly
+6,600 provider-scoped entries from the live feed.
+
+Entries are indexed two ways: by `provider:model`, and by bare model id. The
+second matters because input modality is a property of the *model*, not of the
+gateway reselling it — so a model served by a provider models.dev has never
+heard of is still gated correctly, as long as the model id matches. Where two
+providers describe the same id differently, the merged entry takes the widest
+capability set and the largest context window: this router treats any non-200 as
+a fallback trigger, so overstating a capability costs one attempt that rotates
+onward, while understating it silently removes a candidate that would have
+worked.
+
+A model the catalog has never seen fails open — it is tried, not excluded. To
+correct the catalog for a specific model, use `media_policies` (`allow` forces a
+form through, `deny` blocks it); those outrank anything the catalog says.
 
 ### The describe hop
 
@@ -131,9 +154,22 @@ Only a rate limit or an auth failure tells you something about the *key*. A 5xx 
 
 The chain still terminates: each candidate tries each of its keys at most once per request, tracked per request rather than inferred from the cooldown clock.
 
+**Provider circuit breaker.** `fallback.provider_cooldown_s` (default 60, `0` disables) keeps a candidate that just failed hard out of rotation for a while, instead of re-dialing it at the front of the pool on every request. Without it a dead upstream at the head of a pool charges its full `timeout_s` to *every* request before the chain moves on.
+
+| Upstream says | What happens to the `provider:model` candidate |
+|---|---|
+| Transport error or TTFB timeout | Cooled for `provider_cooldown_s`. |
+| `5xx` | Cooled for `provider_cooldown_s`. |
+| `4xx` | Nothing. It's about the request or the key, not upstream health. |
+| `200` | Cooldown cleared immediately. |
+
+**Escalation.** Repeated failures cost more than one. `provider_failure_threshold` (default 5) counts *consecutive* failures of the same candidate; on reaching it the short cooldown is replaced by `provider_lockout_s` (default 600 — ten minutes), so an upstream that is genuinely down stops being re-probed every minute. The streak deliberately outlives the short cooldown, which is what lets it accumulate; a single `200` resets it to zero. One request counts once — a provider with six keys that fails on all six has failed once, not six times. Set either knob to `0` to keep the single-tier behaviour.
+
+A cooled candidate still appears in the request's decision trail as an `excluded` attempt — `cooling down after a recent failure, retryable in 47s` while it is on the short window, `5 consecutive failures, locked out for another 9m58s` once escalated — so a skipped provider never looks like one that was silently dropped. The breaker **fails open**: if every candidate in a pool is cooling down, all of them are tried anyway — one bad minute must not turn into a hard `503` for the length of the window.
+
 **Client hangs up.** If the caller disconnects (or its deadline passes) mid-chain, the router stops instead of dialing the rest of the pool for a response nobody can receive. Those requests log as `499` so they're distinguishable from a genuine `503` exhaustion.
 
-**Reload caveat.** `SIGHUP` picks up most changes in place, including `key_cooldown_s`. `timeout_s` is applied to the HTTP transport at startup, so changing it needs a restart.
+**Reload caveat.** `SIGHUP` picks up most changes in place, including `key_cooldown_s` and `provider_cooldown_s`. `timeout_s` is applied to the HTTP transport at startup, so changing it needs a restart.
 
 ## Reaching the dashboard remotely
 

@@ -65,6 +65,13 @@ providers:
       strip_params:
       - reasoning_effort
 
+      # For DeepSeek-family gateways that answer 400 "messages[N].
+      # reasoning_content is required for thinking tool-call history". Puts a
+      # placeholder back into any assistant message carrying tool_calls that
+      # arrived without reasoning_content, which OpenAI-compatible clients drop
+      # because it is not part of the OpenAI schema. Off unless set.
+      repair_reasoning_content: false
+
     # An OpenAI-compatible custom provider. Set api_mode: anthropic or
     # api_mode: gemini to talk to those native APIs directly instead.
     my-custom:
@@ -121,3 +128,27 @@ fallback:
   # timeout leaves it usable, since those describe the upstream rather than the
   # key, and keys are shared by all of a provider's models.
   key_cooldown_s: 60
+
+  # Circuit breaker for a whole `provider:model` candidate. After it fails with
+  # a transport error, a TTFB timeout, or a 5xx, it is skipped for this long
+  # instead of being re-dialed at the front of the pool every time — otherwise a
+  # dead upstream charges its full timeout_s to every request that passes
+  # through. A 4xx does not trip it (that is about the request or the key), and
+  # a 200 clears it at once. Skipped candidates are still logged as "excluded"
+  # attempts. If every candidate in a pool is cooling down they are all tried
+  # anyway, so one bad minute cannot become a hard 503 for the whole window.
+  # 0 disables the breaker.
+  provider_cooldown_s: 60
+
+  # Escalation. Count *consecutive* failures of the same provider:model — the
+  # streak survives the short cooldown expiring, and only a 200 resets it — and
+  # once it reaches this many, swap the short cooldown for provider_lockout_s.
+  # A provider that is genuinely down then stops being re-probed every minute.
+  # One request counts once: a provider with six keys that fails on all six has
+  # failed once, not six times. Set the threshold to 0 to disable escalation.
+  provider_failure_threshold: 5
+
+  # The escalated window, in seconds (10 minutes). Called "lockout" rather than
+  # "timeout" because timeout_s above already means the per-attempt TTFB
+  # deadline. 0 also disables escalation.
+  provider_lockout_s: 600

@@ -73,6 +73,11 @@ type Gate struct {
 	mu     sync.RWMutex
 	seed   map[string]ModelInfo
 	remote map[string]ModelInfo
+	// byModel indexes remote entries by bare model id, without the provider
+	// prefix. Input modalities, tool support and context window are properties
+	// of the model itself, not of the gateway reselling it, so a model served
+	// by a provider models.dev has never heard of still gates correctly.
+	byModel map[string]ModelInfo
 }
 
 // NewGate builds a gate from seed entries (seed may be nil).
@@ -81,15 +86,33 @@ func NewGate(seed map[string]ModelInfo) *Gate {
 	for k, v := range seed {
 		cp[k] = v
 	}
-	return &Gate{seed: cp, remote: map[string]ModelInfo{}}
+	return &Gate{seed: cp, remote: map[string]ModelInfo{}, byModel: map[string]ModelInfo{}}
 }
 
+// lookup resolves a routing ref to capability facts, most specific first:
+// the provider-scoped key, then the same key with the legacy "provider/model"
+// spelling, then the bare model id. Callers ask with "provider:model".
 func (g *Gate) lookup(model string) (ModelInfo, bool) {
 	if info, ok := g.remote[model]; ok {
 		return info, true
 	}
-	info, ok := g.seed[model]
-	return info, ok
+	if info, ok := g.seed[model]; ok {
+		return info, true
+	}
+	if alt, ok := altSeparator(model); ok {
+		if info, ok := g.remote[alt]; ok {
+			return info, true
+		}
+		if info, ok := g.seed[alt]; ok {
+			return info, true
+		}
+	}
+	if _, id, ok := splitRef(model); ok {
+		if info, ok := g.byModel[id]; ok {
+			return info, true
+		}
+	}
+	return ModelInfo{}, false
 }
 
 // Check applies the gate: context first, then vision, audio, video, then tools.
@@ -165,18 +188,52 @@ func (g *Gate) Refresh(ctx context.Context, url string, client *http.Client) err
 	return g.RefreshBytes(body)
 }
 
-// RefreshBytes merges a raw catalog JSON payload (map[model_id]ModelInfo).
+// RefreshBytes merges a raw catalog JSON payload. Two shapes are accepted, per
+// top-level entry, so a custom flat catalog and models.dev can be mixed:
+//
+//   - models.dev: provider id → {"models": {model id → {modalities, limit, …}}}.
+//     Indexed both provider-scoped ("groq:llama-3.3-70b") and by bare model id.
+//   - flat: model key → ModelInfo, the original hand-rolled shape.
+//
+// Entries carrying no usable fact are dropped. models.dev lists ~190 providers,
+// and reading that file as if it were flat used to yield one empty ModelInfo per
+// provider — a "successful" refresh that taught the gate nothing.
 func (g *Gate) RefreshBytes(raw []byte) error {
-	var parsed map[string]ModelInfo
-	if err := json.Unmarshal(raw, &parsed); err != nil {
+	var top map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &top); err != nil {
 		return fmt.Errorf("catalog parse: %w", err)
+	}
+	scoped := map[string]ModelInfo{}
+	byModel := map[string]ModelInfo{}
+	for name, blob := range top {
+		if name == "" {
+			continue
+		}
+		var nested modelsDevProvider
+		if err := json.Unmarshal(blob, &nested); err == nil && len(nested.Models) > 0 {
+			for id, m := range nested.Models {
+				info := m.info()
+				if id == "" || info.isZero() {
+					continue
+				}
+				scoped[name+":"+id] = info
+				byModel[id] = widen(byModel[id], info)
+			}
+			continue
+		}
+		var flat ModelInfo
+		if err := json.Unmarshal(blob, &flat); err != nil || flat.isZero() {
+			continue
+		}
+		scoped[name] = flat
 	}
 	g.mu.Lock()
 	defer g.mu.Unlock()
-	for k, v := range parsed {
-		if k != "" {
-			g.remote[k] = v
-		}
+	for k, v := range scoped {
+		g.remote[k] = v
+	}
+	for k, v := range byModel {
+		g.byModel[k] = widen(g.byModel[k], v)
 	}
 	return nil
 }

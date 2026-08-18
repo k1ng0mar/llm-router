@@ -77,6 +77,20 @@ func (res *Result) AttemptedRefs() map[string]bool {
 	return out
 }
 
+// maxBreakerEntries bounds the breaker map. Entries outlive their cooldown so
+// failure streaks can accumulate, and a caller may name arbitrary model strings
+// against a configured provider, so the cold ones are dropped past this size.
+const maxBreakerEntries = 4096
+
+// breakerState is one candidate's health: when it may next be dialed, and how
+// many consecutive hard failures it has taken. The streak deliberately outlives
+// `until` — that is what lets repeated failures escalate from the short
+// cooldown to the long lockout — and only a 200 clears it.
+type breakerState struct {
+	until time.Time
+	fails int
+}
+
 // Router picks candidates and drives fallback for one request.
 type Router struct {
 	cfg     *config.Config
@@ -84,6 +98,16 @@ type Router struct {
 	client  *provider.Client
 	pMu     sync.Mutex
 	pickers map[string]*provider.KeyPicker
+	// breakers is the provider-level circuit-breaker state: ref ("provider:model")
+	// → the earliest time that candidate may be dialed again. A candidate that
+	// fails with a transport error or 5xx is pulled out of rotation for
+	// fallback.provider_cooldown_s instead of being re-dialed at the front of a
+	// pool on every request, which is how one dead upstream used to add its
+	// full per-attempt timeout to each request's path.
+	bMu      sync.Mutex
+	breakers map[string]*breakerState
+	// nowFn is injectable for tests; nil means time.Now.
+	nowFn func() time.Time
 }
 
 // NewRouter wires the router. client may be nil — in that case a
@@ -95,7 +119,88 @@ func NewRouter(cfg *config.Config, gate *catalog.Gate, client *provider.Client) 
 		ttfb := time.Duration(cfg.GetFallback().TimeoutS) * time.Second
 		client = provider.NewClientWithTTFB(ttfb)
 	}
-	return &Router{cfg: cfg, gate: gate, client: client, pickers: map[string]*provider.KeyPicker{}}
+	return &Router{cfg: cfg, gate: gate, client: client, pickers: map[string]*provider.KeyPicker{}, breakers: map[string]*breakerState{}}
+}
+
+// now is the router's clock. Tests inject nowFn to drive breaker expiry without
+// sleeping; production uses time.Now.
+func (r *Router) now() time.Time {
+	if r.nowFn != nil {
+		return r.nowFn()
+	}
+	return time.Now()
+}
+
+// breakerFor reports a candidate's cooldown state: when it may be dialed again
+// and how long its current failure streak is. Expired entries are kept rather
+// than deleted so the streak survives to escalate; clearBreaker and eviction
+// are what remove them.
+func (r *Router) breakerFor(ref string) (breakerState, bool) {
+	r.bMu.Lock()
+	defer r.bMu.Unlock()
+	st, ok := r.breakers[ref]
+	if !ok || !r.now().Before(st.until) {
+		return breakerState{}, false
+	}
+	return *st, true
+}
+
+// tripBreaker records one hard failure against ref and takes it out of
+// rotation. Early failures cost the short cooldown; once the streak reaches
+// provider_failure_threshold the candidate is locked out for provider_lockout_s
+// instead, so an upstream that is genuinely down stops being re-probed every
+// cooldown window. Both windows at 0 disables the breaker.
+//
+// Called at most once per candidate per request: a provider with six keys that
+// fails on all six has failed once, not six times.
+func (r *Router) tripBreaker(ref string) {
+	fb := r.cfg.GetFallback()
+	if fb.ProviderCooldownS <= 0 && fb.ProviderLockoutS <= 0 {
+		return
+	}
+	r.bMu.Lock()
+	defer r.bMu.Unlock()
+	if r.breakers == nil {
+		r.breakers = map[string]*breakerState{}
+	}
+	st, ok := r.breakers[ref]
+	if !ok {
+		st = &breakerState{}
+		r.breakers[ref] = st
+		r.evictColdNoLock()
+	}
+	st.fails++
+	window := fb.ProviderCooldownS
+	if fb.ProviderFailureThreshold > 0 && fb.ProviderLockoutS > 0 && st.fails >= fb.ProviderFailureThreshold {
+		window = fb.ProviderLockoutS
+	}
+	if window <= 0 {
+		// The streak still counts, so escalation can fire even when the short
+		// cooldown is switched off.
+		return
+	}
+	st.until = r.now().Add(time.Duration(window) * time.Second)
+}
+
+// evictColdNoLock bounds the breaker map, dropping entries that are not
+// currently cooling down. Caller holds bMu.
+func (r *Router) evictColdNoLock() {
+	if len(r.breakers) <= maxBreakerEntries {
+		return
+	}
+	now := r.now()
+	for k, st := range r.breakers {
+		if !now.Before(st.until) {
+			delete(r.breakers, k)
+		}
+	}
+}
+
+// clearBreaker puts ref back in rotation after it answers 200.
+func (r *Router) clearBreaker(ref string) {
+	r.bMu.Lock()
+	defer r.bMu.Unlock()
+	delete(r.breakers, ref)
 }
 
 // pickerFor returns the cached KeyPicker for a provider, building one from the
@@ -221,6 +326,25 @@ func (r *Router) RouteExcluding(ctx context.Context, pool string, payload map[st
 		return res, ErrExhausted
 	}
 
+	// Provider circuit breaker. A candidate that recently failed with a
+	// transport error or a 5xx is skipped instead of being re-dialed at the
+	// front of the pool, so one dead upstream stops charging its full TTFB
+	// timeout to every request that passes through. Skipped candidates still
+	// get an "excluded" attempt record, so the decision trail stays complete.
+	//
+	// Fail open: if every candidate is cooling down, honor none of them. A pool
+	// in which everything tripped must still be tried, or one bad minute turns
+	// into a hard 503 for the length of the cooldown.
+	cooling := map[string]breakerState{}
+	for _, ref := range entries {
+		if st, isOpen := r.breakerFor(strings.TrimSpace(ref)); isOpen {
+			cooling[strings.TrimSpace(ref)] = st
+		}
+	}
+	if len(cooling) == len(entries) {
+		cooling = map[string]breakerState{}
+	}
+
 	attemptTimeout := time.Duration(r.cfg.GetFallback().TimeoutS) * time.Second
 	ap := func(providerName, model, keyID string, origin string) *Attempt {
 		res.Attempts = append(res.Attempts, Attempt{})
@@ -238,6 +362,21 @@ candidateLoop:
 		if ctx.Err() != nil {
 			res.Status = statusClientGone
 			return res, ErrExhausted
+		}
+		refKey := strings.TrimSpace(ref)
+		if st, isCooling := cooling[refKey]; isCooling {
+			cName, cModel, cErr := r.cfg.Resolve(ref)
+			if cErr != nil {
+				cName, cModel = ref, ""
+			}
+			att := ap(cName, cModel, "", "router")
+			left := st.until.Sub(r.now()).Round(time.Second)
+			if th := r.cfg.GetFallback().ProviderFailureThreshold; th > 0 && st.fails >= th {
+				att.Err = fmt.Sprintf("excluded: %d consecutive failures, locked out for another %s", st.fails, left)
+			} else {
+				att.Err = fmt.Sprintf("excluded: cooling down after a recent failure, retryable in %s", left)
+			}
+			continue
 		}
 		pName, model, err := r.cfg.Resolve(ref)
 		if err != nil {
@@ -296,8 +435,12 @@ candidateLoop:
 		// parks a key (neither says anything about the key), so the loop has to
 		// know for itself when it has run out of keys to try.
 		tried := make(map[int]bool, len(keys))
+		// Set by any hard failure below. One trip is recorded for the candidate
+		// once its keys are exhausted, so a six-key provider that fails on all
+		// six counts as one failure in the streak, not six.
+		candidateFailed := false
 
-		keyLoop:
+	keyLoop:
 		for {
 			keyIdx, key, okk := picker.NextExcluding(time.Now(), tried)
 			if !okk {
@@ -308,7 +451,7 @@ candidateLoop:
 				break keyLoop
 			}
 			tried[keyIdx] = true
-		att := ap(pName, model, key, "upstream")
+			att := ap(pName, model, key, "upstream")
 
 			// rewrite the model field so the upstream receives the raw model id
 			// without the router's "provider:" namespace prefix
@@ -354,6 +497,17 @@ candidateLoop:
 					delete(upstreamPayload, sp)
 				}
 			}
+			// Some DeepSeek-family gateways reject an assistant tool-call turn
+			// that arrives without reasoning_content. Put a placeholder back so
+			// multi-turn tool conversations survive the second hop. This returns
+			// a fresh payload rather than editing in place — the map is shared
+			// with every other candidate in the chain.
+			if pr.RepairReasoningContent {
+				if repaired, changed := repairReasoningContent(upstreamPayload); changed {
+					upstreamPayload = repaired
+					payloadCopied = true
+				}
+			}
 
 			// The per-attempt TTFB timeout is enforced at the transport
 			// level (ResponseHeaderTimeout), not via context.WithTimeout.
@@ -361,53 +515,70 @@ candidateLoop:
 			// freely under the parent context — the client's own timeout
 			// governs overall request lifetime.
 			start := time.Now()
-		// Substitute per-provider templating in base_url. The supported
-		// placeholder is "{account_id}", replaced by the provider's
-		// AccountID field. A provider with no AccountID keeps "{account_id}"
-		// literal (it will 404 upstream, surfacing a config gap loudly
-		// rather than silently hitting the wrong account).
-		upBaseURL := pr.BaseURL
-		if pr.AccountID != "" && strings.Contains(upBaseURL, "{account_id}") {
-			upBaseURL = strings.ReplaceAll(upBaseURL, "{account_id}", pr.AccountID)
-		}
-		resp, doErr := r.client.Do(ctx, &provider.Upstream{Name: pName, BaseURL: upBaseURL, Keys: keys, APIMode: pr.APIMode}, key, upstreamPayload)
-		att.LatencyMs = int(time.Since(start).Milliseconds())
-
-		if doErr != nil {
-			picker.MarkFailure(keyIdx, time.Now(), 0, 0)
-			// Make the failure legible instead of dumping a raw
-			// `Post "...": context canceled`. Differentiate:
-			//   - attempt deadline hit (upstream too slow)
-			//   - parent request canceled (client left / edge timeout)
-			//   - genuine network/transport error
-			att.Err = describeAttemptError(doErr, attemptTimeout, ctx)
-			// Distinguish "the client left" from "this upstream failed". Only
-			// the latter is worth falling back over; the former used to walk
-			// the entire chain, dialing every provider in the pool on behalf
-			// of a request that had already gone away.
-			if ctx.Err() != nil {
-				res.Status = statusClientGone
-				break candidateLoop
+			// Substitute per-provider templating in base_url. The supported
+			// placeholder is "{account_id}", replaced by the provider's
+			// AccountID field. A provider with no AccountID keeps "{account_id}"
+			// literal (it will 404 upstream, surfacing a config gap loudly
+			// rather than silently hitting the wrong account).
+			upBaseURL := pr.BaseURL
+			if pr.AccountID != "" && strings.Contains(upBaseURL, "{account_id}") {
+				upBaseURL = strings.ReplaceAll(upBaseURL, "{account_id}", pr.AccountID)
 			}
-			continue
-		}
+			resp, doErr := r.client.Do(ctx, &provider.Upstream{Name: pName, BaseURL: upBaseURL, Keys: keys, APIMode: pr.APIMode}, key, upstreamPayload)
+			att.LatencyMs = int(time.Since(start).Milliseconds())
 
-		att.Status = resp.StatusCode
-		var body string
-		switch {
-		case att.Status == 200:
-			picker.MarkSuccess(keyIdx)
-			res.Status = att.Status
-			res.Resp = resp
-			return res, nil
-		default: // any non-200 (4xx, 5xx, 3xx) — record and fall back
-			body = readErrBody(resp)
-			att.Err = body
-			ra := parseRetryAfter(resp.Header)
-			picker.MarkFailure(keyIdx, time.Now(), ra, att.Status)
-			resp.Body.Close()
-			continue
+			if doErr != nil {
+				picker.MarkFailure(keyIdx, time.Now(), 0, 0)
+				// Make the failure legible instead of dumping a raw
+				// `Post "...": context canceled`. Differentiate:
+				//   - attempt deadline hit (upstream too slow)
+				//   - parent request canceled (client left / edge timeout)
+				//   - genuine network/transport error
+				att.Err = describeAttemptError(doErr, attemptTimeout, ctx)
+				// Distinguish "the client left" from "this upstream failed". Only
+				// the latter is worth falling back over; the former used to walk
+				// the entire chain, dialing every provider in the pool on behalf
+				// of a request that had already gone away.
+				if ctx.Err() != nil {
+					res.Status = statusClientGone
+					break candidateLoop
+				}
+				// A dial error or TTFB timeout is the upstream being unhealthy, not
+				// this key or this request — cool the candidate off once the whole
+				// key rotation is done.
+				candidateFailed = true
+				continue
+			}
+
+			att.Status = resp.StatusCode
+			var body string
+			switch {
+			case att.Status == 200:
+				picker.MarkSuccess(keyIdx)
+				// Success ends the streak outright, not just the current window.
+				r.clearBreaker(refKey)
+				res.Status = att.Status
+				res.Resp = resp
+				return res, nil
+			default: // any non-200 (4xx, 5xx, 3xx) — record and fall back
+				body = readErrBody(resp)
+				att.Err = body
+				ra := parseRetryAfter(resp.Header)
+				picker.MarkFailure(keyIdx, time.Now(), ra, att.Status)
+				resp.Body.Close()
+				// 5xx is the upstream failing; 4xx is usually about this request or
+				// this key, and the next request may well succeed. Only the former
+				// is worth pulling the candidate out of rotation for.
+				if att.Status >= 500 {
+					candidateFailed = true
+				}
+				continue
+			}
 		}
+		// One trip per candidate per request, recorded after its keys are spent,
+		// so the failure streak counts requests rather than key rotations.
+		if candidateFailed {
+			r.tripBreaker(refKey)
 		}
 	}
 
