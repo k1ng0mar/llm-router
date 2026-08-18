@@ -1,0 +1,25 @@
+[Unit]
+Description=llm-router - self-hosted LLM router
+After=network-online.target
+Wants=network-online.target
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+WorkingDirectory=%h/llm-router
+ExecStart=%h/llm-router/llm-router serve --config router.yaml
+# SIGHUP reloads router.yaml in place (pools, providers, keys) without dropping
+# in-flight requests. Note fallback.timeout_s is transport-level and needs a
+# real restart, not a reload.
+ExecReload=/bin/kill -HUP $MAINPID
+Restart=always
+RestartSec=5
+KillSignal=SIGTERM
+# the router drains in-flight requests and closes SQLite on SIGTERM, with its
+# own 30s budget — give it room so pending log writes aren't lost
+TimeoutStopSec=45
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=default.target

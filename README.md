@@ -40,7 +40,11 @@ Open the dashboard at `http://127.0.0.1:8015/`.
 Everything lives in `router.yaml`. Copy `router.example.yaml` for a starting point.
 
 - **`router_key`** — the Bearer token every API and dashboard request must carry. Set a strong random value in production.
-- **`pools`** — named lists of `provider:model` entries. Requests pick a pool by header (`X-Route-Pool`) or by sending a model name that matches a pool. A pool named `media` gets requests carrying images, audio, or video (see below).
+- **`pools`** — named lists of `provider:model` entries. A pool named `media` gets requests carrying images, audio, or video (see below). Requests pick a pool in one of these ways:
+  - the `X-Route-Pool` header (wins over everything);
+  - a `model` field naming a pool — `"model": "code"` uses the `code` pool, logged as rule `model-pool`. This is how clients that can only set `model` steer routing;
+  - `"model": "router"`, `"auto"`, or anything unrecognized — the classifier picks;
+  - `"model": "provider:id"`, `"a:x,b:y"`, or `"chain:name"` — bypass pools entirely and use exactly those candidates, in order.
 - **`providers`** — upstream endpoints and keys. `openrouter` and `ollama` are built in; anything else under `providers.custom` is yours. Each provider can set:
   - `base_url` — the API root.
   - `keys` — one or more keys. The router rotates through them.
@@ -133,6 +137,7 @@ The chain still terminates: each candidate tries each of its keys at most once p
 | Path | Purpose |
 |------|---------|
 | `POST /v1/chat/completions` | The chat endpoint. OpenAI-compatible. |
+| `GET /v1/models` | Lists the routable model names: `router`, `auto`, and every pool. OpenAI-compatible, so a client's model picker offers real routing choices. |
 | `GET /healthz` | Health check. |
 | `GET /` | Dashboard. |
 | `GET /api/config` | Read config (providers, pools). |
@@ -141,7 +146,22 @@ The chain still terminates: each candidate tries each of its keys at most once p
 
 ## Running it properly
 
-It's a long-lived process. Run it under systemd or similar so it restarts if it dies. It handles `SIGHUP` to reload `router.yaml` in place, so you can change config without a restart — with one exception, `timeout_s`, which is fixed at startup (see [Timeouts and key health](#timeouts-and-key-health)).
+It's a long-lived process, so run it under a supervisor. `contrib/llm-router.service` is a ready systemd unit — a *user* unit, so it needs no root:
+
+```bash
+mkdir -p ~/.config/systemd/user
+cp contrib/llm-router.service ~/.config/systemd/user/
+systemctl --user daemon-reload
+systemctl --user enable --now llm-router
+loginctl enable-linger "$USER"   # so it starts at boot without you logged in
+```
+
+```bash
+systemctl --user status llm-router
+journalctl --user -u llm-router -f
+```
+
+`systemctl --user reload` sends `SIGHUP`, which re-reads `router.yaml` in place — same PID, no dropped requests — so pool, provider and key edits need no downtime. The one exception is `timeout_s`: it is applied to the HTTP transport at startup, so changing it needs a real `restart` (see [Timeouts and key health](#timeouts-and-key-health)). The unit allows 45s to stop, which gives the router room for its own 30s drain so pending log writes survive a restart.
 
 ## Development
 
@@ -164,4 +184,5 @@ internal/provider/       upstream HTTP calls, non-OpenAI translation
 internal/route/          the request lifecycle: gate, route, fallback, log
 internal/server/         HTTP server, dashboard, config API
 internal/store/          SQLite request log
+contrib/                 systemd unit
 ```

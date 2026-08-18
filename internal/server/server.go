@@ -16,6 +16,7 @@ import (
 	"io/fs"
 	"log"
 	"net/http"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -86,6 +87,7 @@ func (s *Server) Handler() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("POST /v1/chat/completions", s.handleChat)
 	mux.HandleFunc("GET /healthz", s.handleHealthz)
+	mux.HandleFunc("GET /v1/models", s.handleListModels)
 	mux.HandleFunc("GET /api/requests", s.handleRequests)
 	mux.HandleFunc("GET /api/stats", s.handleStats)
 	mux.HandleFunc("GET /api/usage/models", s.handleModelUsage)
@@ -126,6 +128,40 @@ func serveIcon(path string) http.HandlerFunc {
 		w.Header().Set("Content-Type", "image/png")
 		w.Write(data)
 	}
+}
+
+// handleListModels answers the OpenAI /v1/models call with the router's pools,
+// plus "auto" and "router" for "you pick". These are exactly the values a client
+// may put in the model field, so an OpenAI-compatible client's model picker
+// offers real routing choices instead of a list of upstream model ids the router
+// would ignore.
+//
+// Without this route the mux's catch-all GET / served the dashboard HTML here —
+// 142KB of text/html under a 200, which a client's model discovery would either
+// fail to parse or, worse, misparse.
+func (s *Server) handleListModels(w http.ResponseWriter, r *http.Request) {
+	if !s.authorized(r) {
+		writeJSON(w, http.StatusUnauthorized, map[string]any{"error": map[string]string{"message": "unauthorized"}})
+		return
+	}
+	type model struct {
+		ID      string `json:"id"`
+		Object  string `json:"object"`
+		OwnedBy string `json:"owned_by"`
+	}
+	out := []model{
+		{ID: "router", Object: "model", OwnedBy: "llm-router"},
+		{ID: "auto", Object: "model", OwnedBy: "llm-router"},
+	}
+	pools := make([]string, 0, len(s.cfg.GetPools()))
+	for name := range s.cfg.GetPools() {
+		pools = append(pools, name)
+	}
+	sort.Strings(pools) // stable ordering so a client's cache doesn't churn
+	for _, name := range pools {
+		out = append(out, model{ID: name, Object: "model", OwnedBy: "llm-router"})
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"object": "list", "data": out})
 }
 
 func (s *Server) handleHealthz(w http.ResponseWriter, r *http.Request) {
@@ -186,7 +222,28 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 	// One pass decides the pool and reports every modality present. Requests
 	// carrying media and matching no keyword heuristic land in the media pool
 	// (images, audio and video alike) rather than the plain default pool.
+	// A bare pool name in the model field selects that pool, exactly like the
+	// X-Route-Pool header (the header wins when both are set). This is what the
+	// docs have always promised, and without it the model field silently fell
+	// through to the classifier's choice — so any client that can only set
+	// `model`, which is most of them, could never steer routing at all.
+	//
+	// Only a name that actually matches a pool is treated this way. Anything
+	// else — "auto", a chain, a provider:model ref, a bare model id — is left
+	// for resolveEntries to interpret as before.
+	modelPool := false
+	if hint == "" {
+		if m, _ := payload["model"].(string); m != "" {
+			if _, ok := s.cfg.GetPools()[strings.TrimSpace(m)]; ok {
+				hint = strings.TrimSpace(m)
+				modelPool = true
+			}
+		}
+	}
 	pool, rule, _, media := classify.PoolForMedia(s.cfg.GetClassifierHeuristics(), messages, s.cfg.GetDefault(), hint, s.cfg.GetMediaPool())
+	if modelPool && rule == "hint" {
+		rule = "model-pool" // distinguish it from a header hint in the log
+	}
 	hasImage, hasAudio, hasVideo := media.Image, media.Audio, media.Video
 	streaming, _ := payload["stream"].(bool)
 	// Vision chain. When an image lands in a pool whose models can't read
