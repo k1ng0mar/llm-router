@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"strconv"
 	"strings"
 	"sync"
 
@@ -13,6 +14,10 @@ import (
 )
 
 const defaultCatalogURL = "https://models.dev/api.json"
+
+// keepSentinel marks a key the caller wants preserved without transmitting it.
+// Prefer the indexed form "__KEEP__:<n>"; see SetProviderKeys.
+const keepSentinel = "__KEEP__"
 
 // Media policy values, used per model per modality. A modality left empty (or
 // set to PolicyAuto) defers to the model catalog. PolicyAllow forces the
@@ -146,6 +151,13 @@ type Provider struct {
 	// forwarding to this provider. Use when an upstream rejects params
 	// that other providers accept (e.g. groq rejects `reasoning_effort`).
 	StripParams []string        `yaml:"strip_params"`
+	// KeyLabels are operator-chosen nicknames for the entries in Keys, aligned
+	// by index ("prod", "billing account", "burner"). Purely descriptive — the
+	// router never routes on them — but with several interchangeable keys on one
+	// provider they are the only way to tell which one is in cooldown or dead.
+	// Shorter than Keys (or absent) is fine; the dashboard falls back to
+	// "Key <n>" for any entry without a label.
+	KeyLabels []string `yaml:"key_labels"`
 	// MediaPolicies overrides catalog media capability per model id (same
 	// keying as ModelLimits). It lets an operator force a modality through
 	// for a model the catalog under-reports, or deny one the catalog wrongly
@@ -394,13 +406,13 @@ func (c *Config) Redacted() map[string]any {
 	}
 	provs := map[string]any{}
 	if c.Providers.OpenRouter != nil {
-		provs["openrouter"] = map[string]any{"base_url": c.Providers.OpenRouter.BaseURL, "keys": maskList(c.Providers.OpenRouter.Keys, mask), "enabled": c.Providers.OpenRouter.IsEnabled(), "disabled_models": c.Providers.OpenRouter.DisabledModels, "strip_params": c.Providers.OpenRouter.StripParams, "model_limits": c.Providers.OpenRouter.ModelLimits, "media_policies": c.Providers.OpenRouter.MediaPolicies, "preset": true}
+		provs["openrouter"] = map[string]any{"base_url": c.Providers.OpenRouter.BaseURL, "keys": maskList(c.Providers.OpenRouter.Keys, mask), "enabled": c.Providers.OpenRouter.IsEnabled(), "disabled_models": c.Providers.OpenRouter.DisabledModels, "strip_params": c.Providers.OpenRouter.StripParams, "key_labels": c.Providers.OpenRouter.KeyLabels, "model_limits": c.Providers.OpenRouter.ModelLimits, "media_policies": c.Providers.OpenRouter.MediaPolicies, "preset": true}
 	}
 	if c.Providers.Ollama != nil {
-		provs["ollama"] = map[string]any{"base_url": c.Providers.Ollama.BaseURL, "keys": maskList(c.Providers.Ollama.Keys, mask), "enabled": c.Providers.Ollama.IsEnabled(), "disabled_models": c.Providers.Ollama.DisabledModels, "strip_params": c.Providers.Ollama.StripParams, "model_limits": c.Providers.Ollama.ModelLimits, "media_policies": c.Providers.Ollama.MediaPolicies, "preset": true}
+		provs["ollama"] = map[string]any{"base_url": c.Providers.Ollama.BaseURL, "keys": maskList(c.Providers.Ollama.Keys, mask), "enabled": c.Providers.Ollama.IsEnabled(), "disabled_models": c.Providers.Ollama.DisabledModels, "strip_params": c.Providers.Ollama.StripParams, "key_labels": c.Providers.Ollama.KeyLabels, "model_limits": c.Providers.Ollama.ModelLimits, "media_policies": c.Providers.Ollama.MediaPolicies, "preset": true}
 	}
 	for name, p := range c.Providers.Custom {
-		provs[name] = map[string]any{"base_url": p.BaseURL, "account_id": p.AccountID, "keys": maskList(p.Keys, mask), "enabled": p.IsEnabled(), "disabled_models": p.DisabledModels, "strip_params": p.StripParams, "model_limits": p.ModelLimits, "media_policies": p.MediaPolicies, "preset": p.Preset, "api_mode": p.APIMode}
+		provs[name] = map[string]any{"base_url": p.BaseURL, "account_id": p.AccountID, "keys": maskList(p.Keys, mask), "enabled": p.IsEnabled(), "disabled_models": p.DisabledModels, "strip_params": p.StripParams, "key_labels": p.KeyLabels, "model_limits": p.ModelLimits, "media_policies": p.MediaPolicies, "preset": p.Preset, "api_mode": p.APIMode}
 	}
 	heuristics := map[string][]string{}
 	for pool, kws := range c.Classifier.Heuristics {
@@ -709,10 +721,15 @@ func (c *Config) SetProvider(name, baseURL, accountID string, keys []string, api
 	return c.persistNoLock()
 }
 
-// SetProviderKeys replaces the key list on an existing provider.
-// Built-in providers (openrouter, ollama) are allowed — they need key
-// management too. ollama simply ignores keys (localhost).
-func (c *Config) SetProviderKeys(name string, keys []string) error {
+// SetProviderKeys replaces the key list on an existing provider, and the
+// per-key labels alongside it. Built-in providers (openrouter, ollama) are
+// allowed — they need key management too. ollama simply ignores keys (localhost).
+//
+// labels is index-aligned with keys and may be nil or short; missing entries
+// become empty, which the dashboard renders as "Key <n>". Labels are resolved in
+// lockstep with the values so a label always travels with the key it names, even
+// when __KEEP__ sentinels shift positions.
+func (c *Config) SetProviderKeys(name string, keys []string, labels []string) error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	if name == "" {
@@ -722,29 +739,64 @@ func (c *Config) SetProviderKeys(name string, keys []string) error {
 	if !ok {
 		return fmt.Errorf("provider %q does not exist", name)
 	}
-	// A "__KEEP__" sentinel means "preserve the existing real key at this
-	// position". The dashboard sends masked keys as __KEEP__ so it can
-	// submit the full desired list without ever seeing/round-tripping the
-	// real secret.
+	labelAt := func(i int) string {
+		if i < len(labels) {
+			return strings.TrimSpace(labels[i])
+		}
+		return ""
+	}
+	// A keep-sentinel means "preserve an existing real key". The dashboard sends
+	// masked keys this way so it can submit the full desired list without ever
+	// seeing or round-tripping the real secret.
+	//
+	// "__KEEP__:<n>" names the key by its original index, which is the only form
+	// that survives a removal: a bare "__KEEP__" is consumed in order, so
+	// deleting any key but the last one kept the wrong secret and silently
+	// discarded another. The bare form is still honored for older clients.
 	resolved := make([]string, 0, len(keys))
+	resolvedLabels := make([]string, 0, len(keys))
 	keepIdx := 0
-	for _, k := range keys {
-		if k == "__KEEP__" {
-			// pull the next existing real key
+	for i, k := range keys {
+		if strings.HasPrefix(k, keepSentinel) {
+			if rest := strings.TrimPrefix(k, keepSentinel); strings.HasPrefix(rest, ":") {
+				n, err := strconv.Atoi(strings.TrimSpace(rest[1:]))
+				if err == nil && n >= 0 && n < len(p.Keys) && p.Keys[n] != "" {
+					resolved = append(resolved, p.Keys[n])
+					resolvedLabels = append(resolvedLabels, labelAt(i))
+				}
+				continue // an out-of-range reference drops the entry rather than guessing
+			}
+			// bare sentinel: consume the next existing key in order
 			for keepIdx < len(p.Keys) && p.Keys[keepIdx] == "" {
 				keepIdx++
 			}
 			if keepIdx < len(p.Keys) {
 				resolved = append(resolved, p.Keys[keepIdx])
+				resolvedLabels = append(resolvedLabels, labelAt(i))
 				keepIdx++
 			}
 			continue
 		}
 		resolved = append(resolved, k)
+		resolvedLabels = append(resolvedLabels, labelAt(i))
 	}
 	p.Keys = resolved
+	// drop a trailing run of empty labels so an all-unlabeled provider doesn't
+	// grow a pointless ["", "", ""] in router.yaml
+	for len(resolvedLabels) > 0 && resolvedLabels[len(resolvedLabels)-1] == "" {
+		resolvedLabels = resolvedLabels[:len(resolvedLabels)-1]
+	}
+	p.KeyLabels = resolvedLabels
 	c.autodetectProviderStatesLocked()
 	return c.persistNoLock()
+}
+
+// KeyLabelAt returns the label for the i-th key, or "" when unlabeled.
+func (p *Provider) KeyLabelAt(i int) string {
+	if p == nil || i < 0 || i >= len(p.KeyLabels) {
+		return ""
+	}
+	return p.KeyLabels[i]
 }
 
 // DeleteProvider removes a custom provider. Returns an error if any pool or

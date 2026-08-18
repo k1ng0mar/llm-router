@@ -48,6 +48,7 @@ Everything lives in `router.yaml`. Copy `router.example.yaml` for a starting poi
 - **`providers`** — upstream endpoints and keys. `openrouter` and `ollama` are built in; anything else under `providers.custom` is yours. Each provider can set:
   - `base_url` — the API root.
   - `keys` — one or more keys. The router rotates through them.
+  - `key_labels` — optional nicknames for those keys, index-aligned ("prod", "burner"). Descriptive only, but with several interchangeable keys they're the only way to tell which one is cooling down or dead. Editable per key in the dashboard.
   - `api_mode` — `openai` (default), `anthropic`, or `gemini`. Picks the wire format.
   - `account_id` — fills an `{account_id}` placeholder in `base_url` (used by Cloudflare Workers AI).
   - `model_limits` — per-model `max_tokens` cap, applied as an upper bound.

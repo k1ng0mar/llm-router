@@ -1008,18 +1008,21 @@ func (s *Server) handleSetKeys(w http.ResponseWriter, r *http.Request) {
 	var body struct {
 		Name string   `json:"name"`
 		Keys []string `json:"keys"`
+		// KeyLabels are index-aligned nicknames for Keys. Optional: absent or
+		// short means the remaining keys are unlabeled.
+		KeyLabels []string `json:"key_labels"`
 	}
 	if err := json.NewDecoder(io.LimitReader(r.Body, 1<<20)).Decode(&body); err != nil {
 		writeJSON(w, http.StatusBadRequest, map[string]any{"error": err.Error()})
 		return
 	}
-	if err := s.cfg.SetProviderKeys(body.Name, body.Keys); err != nil {
+	if err := s.cfg.SetProviderKeys(body.Name, body.Keys, body.KeyLabels); err != nil {
 		writeJSON(w, http.StatusBadRequest, map[string]any{"error": err.Error()})
 		return
 	}
 	s.router.InvalidatePicker(body.Name)
 	p, _ := s.cfg.Providers.Get(body.Name)
-	writeJSON(w, http.StatusOK, map[string]any{"name": body.Name, "key_count": len(p.Keys)})
+	writeJSON(w, http.StatusOK, map[string]any{"name": body.Name, "key_count": len(p.Keys), "key_labels": p.KeyLabels})
 
 	// async: fetch and cache models now that keys are set
 	if s.store != nil && p.BaseURL != "" {

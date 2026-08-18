@@ -344,7 +344,11 @@ window.ROUTER_KEY = loadStoredKey();
 
 async function api(url, opts={}) {
   try {
-    const r = await fetch(url, {headers: {'Content-Type': 'application/json', 'Authorization': 'Bearer ' + (window.ROUTER_KEY || ''), ...opts.headers}, ...opts});
+    // opts is spread FIRST so that headers, computed last, always win. The
+    // other order (`{headers: {...}, ...opts}`) let any caller passing its own
+    // `headers` replace the merged object wholesale and drop Authorization —
+    // which is why saving model settings used to 401 and re-prompt for the key.
+    const r = await fetch(url, {...opts, headers: {'Content-Type': 'application/json', 'Authorization': 'Bearer ' + (window.ROUTER_KEY || ''), ...opts.headers}});
     // A 401 mid-session means the key was rotated or cleared — re-lock rather
     // than leaving every panel silently empty, which is what used to happen.
     if (r.status === 401) showLock('That key was rejected. Enter the current router_key.');
@@ -1699,20 +1703,22 @@ async function toggleProvider(name, enabled) { const r = await api('/api/config/
 function openProvDetail(name) {
   const p = currentConfig.providers?.[name]; if (!p) return;
   // keys from API are plain strings; normalize for the detail panel
-  const keys = (p.keys || []).map(k => typeof k === 'string' ? {nick: 'Key ' + ((p.keys||[]).indexOf(k)+1), value: k} : k);
+  // Labels come from the server (provider.key_labels, index-aligned with keys).
+  // They used to be invented client-side as "Key N", which is why a nickname
+  // never survived reopening the panel.
+  const labels = p.key_labels || [];
+  // _origIdx is the key's index on the server. It travels with the row so a
+  // removal names the surviving keys explicitly ("__KEEP__:<n>") instead of
+  // relying on positional consumption, which deleted the wrong key.
+  const keys = (p.keys || []).map((k, i) => typeof k === 'string'
+    ? {nick: labels[i] || '', value: k, _origIdx: i}
+    : {nick: (k.nick || labels[i] || ''), value: (k.value || ''), _origIdx: i});
   currentProvDetail = {name, baseUrl: p.base_url||'', keys, enabled: p.enabled, accountId: p.account_id||'', apiMode: p.api_mode||'', modelLimits: p.model_limits||{}, disabledModels: p.disabled_models||[], mediaPolicies: p.media_policies||{}, fetchedModels: []};
   document.getElementById('prov-detail-name').textContent = name;
   const keyCount = keys.length;
   const isLocal = (p.base_url||'').includes('127.0.0.1') || (p.base_url||'').includes('localhost');
-  const keyRows = keys.length > 0 ? keys.map((k,i) => {
-    const val = typeof k === 'string' ? k : (k.value || '');
-    const nick = typeof k === 'string' ? 'Key ' + (i+1) : (k.nick || ('Key ' + (i+1)));
-    return `<tr>
-      <td class="py-2 text-sm">${esc(nick)}</td>
-      <td class="py-2 text-sm font-mono">${esc(val.slice(0,3))}${val.length>7?'··':''}${esc(val.slice(-4))}</td>
-      <td class="py-2 text-right"><button onclick="removeProvKey(${i})" class="text-trend-red text-sm hover:underline">Remove</button></td>
-    </tr>`;
-  }).join('') : '<tr><td colspan="3" class="py-3 text-sm text-on-surface-variant">No keys configured.</td></tr>';
+  const keyRows = keys.length > 0 ? keys.map((k,i) => keyRowHTML(k, i)).join('')
+    : '<tr><td colspan="3" class="py-3 text-sm text-on-surface-variant">No keys configured.</td></tr>';
   document.getElementById('prov-detail-body').innerHTML = `
     <div class="border border-outline-variant rounded p-4 bg-surface-container-low flex flex-col gap-3">
       <h3 class="text-xs uppercase text-on-surface-variant">General Configuration</h3>
@@ -1807,7 +1813,7 @@ function removeProvKeyRow(btn) {
 }
 function confirmAddProvKey(btn) {
   const row = btn.closest('tr');
-  const nick = row.querySelector('[data-key-nick]').value.trim() || 'Key ' + (currentProvDetail.keys.length + 1);
+  const nick = row.querySelector('[data-key-nick]').value.trim();
   const value = row.querySelector('[data-key-value]').value.trim();
   if (!value) { showProvToast('Please enter an API key', true); return; }
   currentProvDetail.keys.push({nick, value, _isNew: true});
@@ -1817,18 +1823,27 @@ function removeProvKey(i) {
   currentProvDetail.keys.splice(i, 1);
   renderKeyTable();
 }
+// keyRowHTML renders one key row. The nickname is an input on every row, not
+// just newly added ones, so an existing key can be renamed; `data-key-index`
+// ties it back to currentProvDetail.keys so saveProvDetail can collect labels
+// in order.
+function keyRowHTML(k, i) {
+  const val = typeof k === 'string' ? k : (k.value || '');
+  const nick = typeof k === 'string' ? '' : (k.nick || '');
+  const masked = val === '__KEEP__' ? '••••' : esc(val.slice(0,3)) + (val.length>7?'··':'') + esc(val.slice(-4));
+  return `<tr>
+    <td class="py-2 text-sm"><input value="${esc(nick)}" data-key-index="${i}" placeholder="Key ${i+1}"
+      class="border border-outline-variant bg-white rounded px-2 py-1 text-sm w-full"
+      title="Nickname for this key — saved with Save Provider Settings"></td>
+    <td class="py-2 text-sm font-mono">${masked}</td>
+    <td class="py-2 text-right"><button onclick="removeProvKey(${i})" class="text-trend-red text-sm hover:underline">Remove</button></td>
+  </tr>`;
+}
 function renderKeyTable() {
   const tbody = document.getElementById('prov-key-tbody');
   const keys = currentProvDetail.keys;
-  tbody.innerHTML = keys.length > 0 ? keys.map((k,i) => {
-    const val = typeof k === 'string' ? k : (k.value || '');
-    const nick = typeof k === 'string' ? 'Key ' + (i+1) : (k.nick || ('Key ' + (i+1)));
-    return `<tr>
-      <td class="py-2 text-sm">${esc(nick)}</td>
-      <td class="py-2 text-sm font-mono">${esc(val.slice(0,3))}${val.length>7?'··':''}${esc(val.slice(-4))}</td>
-      <td class="py-2 text-right"><button onclick="removeProvKey(${i})" class="text-trend-red text-sm hover:underline">Remove</button></td>
-    </tr>`;
-  }).join('') : '<tr><td colspan="3" class="py-3 text-sm text-on-surface-variant">No keys configured.</td></tr>';
+  tbody.innerHTML = keys.length > 0 ? keys.map((k,i) => keyRowHTML(k, i)).join('')
+    : '<tr><td colspan="3" class="py-3 text-sm text-on-surface-variant">No keys configured.</td></tr>';
 }
 async function saveProvDetail() {
   if (!currentProvDetail) return;
@@ -1848,27 +1863,41 @@ async function saveProvDetail() {
   }
   // collect keys: existing masked keys → __KEEP__ sentinel (server preserves real key),
   // only newly-added keys (typed in this session) are sent as plaintext
-  const allKeys = [];
+  // Read the nickname inputs back into state first, so edits to existing rows
+  // are not lost — they only lived in the DOM until now.
+  document.querySelectorAll('[data-key-index]').forEach(inp => {
+    const i = parseInt(inp.dataset.keyIndex, 10);
+    if (!isNaN(i) && currentProvDetail.keys[i]) currentProvDetail.keys[i].nick = inp.value.trim();
+  });
+  const allKeys = [], allLabels = [];
   currentProvDetail.keys.forEach(k => {
     const val = typeof k === 'string' ? k : (k.value || '');
     if (k._isNew) {
       // newly added key — send the real value
-      if (val) allKeys.push(val);
+      if (val) { allKeys.push(val); allLabels.push(k.nick || ''); }
     } else {
-      // existing key (masked from API) — tell server to preserve it
-      allKeys.push('__KEEP__');
+      // existing key (masked from API) — name it by its original index so the
+      // server preserves *this* one, not whichever comes next in order
+      allKeys.push(k._origIdx != null ? '__KEEP__:' + k._origIdx : '__KEEP__');
+      allLabels.push(k.nick || '');
     }
   });
   // also collect keys from pending form input rows (not yet confirmed)
   document.querySelectorAll('[data-key-value]').forEach(row => {
     const val = row.value.trim();
-    if (val) allKeys.push(val);
+    if (!val) return;
+    allKeys.push(val);
+    const nickInput = row.closest('tr')?.querySelector('[data-key-nick]');
+    allLabels.push(nickInput ? nickInput.value.trim() : '');
   });
-  await api('/api/config/keys', {method:'POST', body:JSON.stringify({name, keys: allKeys})})
+  await api('/api/config/keys', {method:'POST', body:JSON.stringify({name, keys: allKeys, key_labels: allLabels})})
   // clear the form rows and mark keys as no longer new
   document.querySelectorAll('[data-key-value]').forEach(row => row.closest('tr')?.remove());
   currentProvDetail.keys.forEach(k => { if (k._isNew) k._isNew = false; });
   currentProvDetail.keys.forEach(k => { k.value = '__KEEP__'; });
+  if (currentConfig.providers && currentConfig.providers[name]) {
+    currentConfig.providers[name].key_labels = currentProvDetail.keys.map(k => k.nick || '');
+  }
   // update toggle if changed
   const toggleOn = document.getElementById('prov-detail-toggle').classList.contains('on');
   if (toggleOn !== enabled) {
@@ -2036,7 +2065,6 @@ async function saveModelSettings() {
   try {
     await api('/api/config/providers/' + encodeURIComponent(name), {
       method: 'PUT',
-      headers: {'Content-Type': 'application/json'},
       body: JSON.stringify({model_limits: modelLimits || {}, disabled_models: disabledModels || [], media_policies: mediaPolicies || {}})
     });
     showProvToast('Model settings saved');
