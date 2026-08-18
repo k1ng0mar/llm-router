@@ -12,7 +12,7 @@ It's plain Go, no framework, one binary. SQLite keeps the request log.
 - **Media pool.** Images, audio, and video all route to one `media` pool. The gate picks the entry that can handle whichever form arrived, so a pool can mix single-modality models freely.
 - **Capability gate.** It knows what each model can do (context window, image/audio/video, tools) and won't send a request a model can't handle. You can override it per model when the catalog is wrong.
 - **Non-OpenAI upstreams.** Most providers speak OpenAI's format. For Anthropic and Gemini, set `api_mode` on the provider and the router translates the request and response for you.
-- **Dashboard.** A read/write web UI: watch requests live, see where they routed, edit config, add providers, build pools.
+- **Dashboard.** A read/write web UI: watch requests live, see where they routed, edit config, add providers, build pools. Unlocks with your `router_key`, so it's safe to reach over a private network.
 - **Request log.** Every request and attempt lands in SQLite, so you can go back and see exactly what happened and what it cost.
 
 ## Quick start
@@ -130,7 +130,24 @@ Only a rate limit or an auth failure tells you something about the *key*. A 5xx 
 
 The chain still terminates: each candidate tries each of its keys at most once per request, tracked per request rather than inferred from the cooldown clock.
 
+**Client hangs up.** If the caller disconnects (or its deadline passes) mid-chain, the router stops instead of dialing the rest of the pool for a response nobody can receive. Those requests log as `499` so they're distinguishable from a genuine `503` exhaustion.
+
 **Reload caveat.** `SIGHUP` picks up most changes in place, including `key_cooldown_s`. `timeout_s` is applied to the HTTP transport at startup, so changing it needs a restart.
+
+## Reaching the dashboard remotely
+
+The router binds `127.0.0.1` and should stay that way. To use the dashboard from another machine, put a private network in front of it rather than changing `listen`. With [Tailscale](https://tailscale.com):
+
+```bash
+tailscale serve --bg --https=8443 http://127.0.0.1:8015
+# -> https://<your-machine>.<tailnet>.ts.net:8443  (tailnet only)
+```
+
+Pick a port that isn't already serving something (`tailscale serve status` shows what is). The dashboard's absolute `/api/...` paths mean it wants the root of a port, not a sub-path mount.
+
+The page itself is a static shell served without auth; every `/api` call carries the `router_key` as a Bearer token, which you enter once in the unlock screen and which is kept in that browser's `localStorage`. The server never embeds the key in the page, so serving the HTML gives nothing away, and **Lock** in the header clears it from the device.
+
+Do not put this behind `tailscale funnel`. Funnel publishes to the open internet, and this dashboard can read and write provider config — anyone who obtains the key controls your upstream spend. Keep it tailnet-only.
 
 ## Endpoints
 

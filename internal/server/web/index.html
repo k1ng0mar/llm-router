@@ -83,6 +83,10 @@ table { border-collapse: collapse; }
       <a onclick="showPage('playground')" class="nav-link cursor-pointer text-sm pb-1 whitespace-nowrap" data-page="playground">Playground</a>
     </div>
   </div>
+  <button onclick="lockDashboard()" title="Forget the stored router_key on this device" class="text-on-surface-variant hover:text-primary flex items-center gap-1 text-sm shrink-0">
+    <span class="material-symbols-outlined" style="font-size:20px">lock</span>
+    <span class="hidden md:inline">Lock</span>
+  </button>
 </nav>
 
 <!-- Bottom Nav (mobile/PWA) -->
@@ -323,9 +327,27 @@ let currentRange = '7d', currentDetail = null, currentProvDetail = null;
 
 // --- helpers ---
 function esc(s) { return String(s||'').replace(/[&<>"']/g, c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c])); }
+// --- auth ---------------------------------------------------------------
+// The dashboard HTML is static and served unauthenticated; every /api call
+// carries the router key as a Bearer token. The key is entered once in the
+// unlock screen and kept in localStorage, so it is never embedded in the page
+// the server hands out — which is what makes it safe to expose this dashboard
+// beyond localhost (behind a private network such as a Tailscale tailnet).
+const ROUTER_KEY_STORE = 'llm_router_key';
+function loadStoredKey() {
+  try { return localStorage.getItem(ROUTER_KEY_STORE) || ''; } catch(e) { return ''; }
+}
+function storeKey(k) {
+  try { k ? localStorage.setItem(ROUTER_KEY_STORE, k) : localStorage.removeItem(ROUTER_KEY_STORE); } catch(e) {}
+}
+window.ROUTER_KEY = loadStoredKey();
+
 async function api(url, opts={}) {
   try {
-    const r = await fetch(url, {headers: {'Content-Type': 'application/json', 'Authorization': 'Bearer ' + (window.ROUTER_KEY || 'change-me'), ...opts.headers}, ...opts});
+    const r = await fetch(url, {headers: {'Content-Type': 'application/json', 'Authorization': 'Bearer ' + (window.ROUTER_KEY || ''), ...opts.headers}, ...opts});
+    // A 401 mid-session means the key was rotated or cleared — re-lock rather
+    // than leaving every panel silently empty, which is what used to happen.
+    if (r.status === 401) showLock('That key was rejected. Enter the current router_key.');
     let data; try { data = await r.json(); } catch { data = null; }
     return {ok: r.ok, status: r.status, data};
   } catch(e) {
@@ -2368,7 +2390,71 @@ async function runPlayground() {
 }
 
 // --- init ---
+// showLock overlays an unlock prompt. Built here rather than in the static
+// markup so it works no matter which page was deep-linked.
+function showLock(message) {
+  if (document.getElementById('lock-overlay')) {
+    if (message) document.getElementById('lock-msg').textContent = message;
+    return;
+  }
+  const el = document.createElement('div');
+  el.id = 'lock-overlay';
+  el.style.cssText = 'position:fixed;inset:0;z-index:9999;display:flex;align-items:center;justify-content:center;background:var(--md-sys-color-surface,#fff);padding:1.5rem';
+  el.innerHTML = `
+    <div style="max-width:26rem;width:100%" class="flex flex-col gap-3">
+      <div class="flex items-center gap-2">
+        <span class="material-symbols-outlined">lock</span>
+        <h1 class="text-lg font-medium">llm-router</h1>
+      </div>
+      <p id="lock-msg" class="text-sm text-on-surface-variant">${esc(message || 'Enter your router_key to view the dashboard.')}</p>
+      <input id="lock-input" type="password" autocomplete="current-password" placeholder="router_key"
+        class="border border-outline-variant bg-white rounded px-3 py-2 text-sm font-mono">
+      <button id="lock-go" class="bg-primary text-on-primary text-sm px-3 py-2 rounded hover:opacity-90">Unlock</button>
+      <p class="text-xs text-on-surface-variant">Stored in this browser only. The server never puts the key in this page.</p>
+    </div>`;
+  document.body.appendChild(el);
+  const input = el.querySelector('#lock-input');
+  const submit = async () => {
+    const k = input.value.trim();
+    if (!k) return;
+    const probe = await probeKey(k);
+    if (probe) {
+      window.ROUTER_KEY = k;
+      storeKey(k);
+      el.remove();
+      init();
+    } else {
+      document.getElementById('lock-msg').textContent = 'Rejected. Check router_key in router.yaml.';
+      input.select();
+    }
+  };
+  el.querySelector('#lock-go').addEventListener('click', submit);
+  input.addEventListener('keydown', e => { if (e.key === 'Enter') submit(); });
+  input.focus();
+}
+
+// probeKey checks a candidate key against an authenticated endpoint without
+// going through api() — api() would recurse into showLock on a 401.
+async function probeKey(k) {
+  try {
+    const r = await fetch('/api/stats', {headers: {'Authorization': 'Bearer ' + k}});
+    return r.ok;
+  } catch(e) { return false; }
+}
+
+function lockDashboard() {
+  window.ROUTER_KEY = '';
+  storeKey('');
+  location.reload();
+}
+
 async function init() {
+  // Gate everything behind a working key: without this the dashboard loaded and
+  // then failed every request with a 401, showing empty panels and no reason.
+  if (!window.ROUTER_KEY || !(await probeKey(window.ROUTER_KEY))) {
+    showLock();
+    return;
+  }
   // load config first so renderConfig has data
   await loadConfig();
   const hash = window.location.hash.slice(1);

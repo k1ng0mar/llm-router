@@ -199,3 +199,81 @@ func TestTimeoutDoesNotParkTheKey(t *testing.T) {
 		t.Fatalf("upstream hits = %d, want 2 — a timed-out key must stay usable for the next request", got)
 	}
 }
+
+// TestClientDisconnectStopsTheChain: when the caller hangs up, the remaining
+// candidates have nobody to answer to. The chain used to walk every one of them,
+// dialing each provider in the pool on behalf of a request that had gone away —
+// six attempts deep in a real pool.
+func TestClientDisconnectStopsTheChain(t *testing.T) {
+	var hits atomic.Int32
+	hang := hangingStub(t, &hits)
+
+	cfg := &config.Config{
+		Default: "chat",
+		Pools:   map[string][]string{"chat": {"a:m", "b:m", "c:m", "d:m"}},
+		Providers: config.Providers{Custom: map[string]*config.Provider{
+			"a": {BaseURL: hang.URL, Keys: []string{"k"}},
+			"b": {BaseURL: hang.URL, Keys: []string{"k"}},
+			"c": {BaseURL: hang.URL, Keys: []string{"k"}},
+			"d": {BaseURL: hang.URL, Keys: []string{"k"}},
+		}},
+		Fallback: config.FallbackCfg{TimeoutS: 30, Strategy: "round_robin", KeyCooldownS: 60},
+	}
+	r := NewRouter(cfg, catalog.NewGate(nil), provider.NewClientWithTTFB(5*time.Second))
+
+	// cancel while the first attempt is still waiting for headers
+	ctx, cancel := context.WithCancel(context.Background())
+	go func() {
+		time.Sleep(150 * time.Millisecond)
+		cancel()
+	}()
+
+	res, err := r.Route(ctx, "chat", map[string]any{"model": "auto"}, false, false, false, 10)
+	if err == nil {
+		t.Fatal("expected the chain to end unsuccessfully")
+	}
+	if res.Status != statusClientGone {
+		t.Fatalf("status = %d, want %d (client gone, not an upstream failure)", res.Status, statusClientGone)
+	}
+	// exactly one upstream was dialed: the one in flight when the client left
+	if got := hits.Load(); got != 1 {
+		t.Fatalf("upstream dials = %d, want 1 — the rest of the pool must not be tried", got)
+	}
+	if len(res.Attempts) != 1 {
+		t.Fatalf("attempts = %d, want 1", len(res.Attempts))
+	}
+	if !strings.Contains(res.Attempts[0].Err, "client disconnected") {
+		t.Fatalf("attempt err = %q, want it to name the disconnect", res.Attempts[0].Err)
+	}
+}
+
+// A cancel that lands before any attempt must not dial anything at all.
+func TestPreCanceledContextDialsNothing(t *testing.T) {
+	var hits atomic.Int32
+	hang := hangingStub(t, &hits)
+
+	cfg := &config.Config{
+		Default: "chat",
+		Pools:   map[string][]string{"chat": {"a:m", "b:m"}},
+		Providers: config.Providers{Custom: map[string]*config.Provider{
+			"a": {BaseURL: hang.URL, Keys: []string{"k"}},
+			"b": {BaseURL: hang.URL, Keys: []string{"k"}},
+		}},
+		Fallback: config.FallbackCfg{TimeoutS: 30, Strategy: "round_robin", KeyCooldownS: 60},
+	}
+	r := NewRouter(cfg, catalog.NewGate(nil), provider.NewClientWithTTFB(time.Second))
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	res, err := r.Route(ctx, "chat", map[string]any{"model": "auto"}, false, false, false, 10)
+	if err == nil {
+		t.Fatal("expected failure on a pre-canceled context")
+	}
+	if res.Status != statusClientGone {
+		t.Fatalf("status = %d, want %d", res.Status, statusClientGone)
+	}
+	if got := hits.Load(); got != 0 {
+		t.Fatalf("upstream dials = %d, want 0", got)
+	}
+}

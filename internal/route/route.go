@@ -35,6 +35,12 @@ import (
 // ErrExhausted means every candidate failed. Callers map it to a clean 503.
 var ErrExhausted = errors.New("all candidates failed; fallback exhausted")
 
+// statusClientGone marks a chain abandoned because the caller disconnected or
+// its deadline passed, rather than because upstreams failed. It borrows nginx's
+// 499 so the event log can tell the two apart at a glance — no response is
+// delivered in this case either way.
+const statusClientGone = 499
+
 // Attempt is one upstream call (or a structural exclusion) in the trail.
 type Attempt struct {
 	Seq         int
@@ -224,7 +230,15 @@ func (r *Router) RouteExcluding(ctx context.Context, pool string, payload map[st
 		return att
 	}
 
+candidateLoop:
 	for _, ref := range entries {
+		// Nothing to answer to: the caller hung up (or its deadline passed)
+		// before we got here. Every remaining candidate would be dialed for a
+		// response that can never be delivered.
+		if ctx.Err() != nil {
+			res.Status = statusClientGone
+			return res, ErrExhausted
+		}
 		pName, model, err := r.cfg.Resolve(ref)
 		if err != nil {
 			att := ap(ref, "", "", "router")
@@ -367,6 +381,14 @@ func (r *Router) RouteExcluding(ctx context.Context, pool string, payload map[st
 			//   - parent request canceled (client left / edge timeout)
 			//   - genuine network/transport error
 			att.Err = describeAttemptError(doErr, attemptTimeout, ctx)
+			// Distinguish "the client left" from "this upstream failed". Only
+			// the latter is worth falling back over; the former used to walk
+			// the entire chain, dialing every provider in the pool on behalf
+			// of a request that had already gone away.
+			if ctx.Err() != nil {
+				res.Status = statusClientGone
+				break candidateLoop
+			}
 			continue
 		}
 
@@ -389,7 +411,9 @@ func (r *Router) RouteExcluding(ctx context.Context, pool string, payload map[st
 		}
 	}
 
-	res.Status = 503
+	if res.Status != statusClientGone {
+		res.Status = 503
+	}
 	return res, ErrExhausted
 }
 
