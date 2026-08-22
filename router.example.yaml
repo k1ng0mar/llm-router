@@ -117,9 +117,6 @@ classifier:
     - 'def '
     - 'import '
     - 'func '
-    reasoning:
-    - 'why '
-    - 'prove'
 
 fallback:
   # Time to first byte for ONE key — not total response time. On expiry the

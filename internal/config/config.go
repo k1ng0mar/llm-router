@@ -264,11 +264,9 @@ func DefaultConfig() *Config {
 		CatalogURL: defaultCatalogURL,
 		Default:    "chat",
 		Pools: map[string][]string{
-			"chat":      {},
-			"code":      {},
-			"creative":  {},
-			"reasoning": {},
-			"media":     {},
+			"chat":  {},
+			"code":  {},
+			"media": {},
 		},
 		Chains:            map[string][]string{},
 		Tiers:             map[string][]string{},
@@ -277,8 +275,7 @@ func DefaultConfig() *Config {
 		Classifier: ClassifierCfg{
 			HintsFirst: true,
 			Heuristics: map[string][]string{
-				"code":      {"def ", "import ", "func ", "select ", "gradle", "npm ", "git ", "docker", "python", "class ", "const ", "function "},
-				"reasoning": {"why ", "explain the tradeoffs", "prove", "plan the"},
+				"code": {"def ", "import ", "func ", "select ", "gradle", "npm ", "git ", "docker", "python", "class ", "const ", "function "},
 			},
 		},
 		Fallback: FallbackCfg{
