@@ -91,6 +91,13 @@ func serve(args []string) {
 		}
 	}
 
+	// Quota-aware pool ordering: point the route package at the quota file, if
+	// one is configured. Empty quota_file disables it entirely (no disk access).
+	route.SetQuotaFile(cfg.QuotaFile)
+	if cfg.QuotaFile != "" {
+		log.Printf("quota-aware routing enabled (quota_file: %s)", cfg.QuotaFile)
+	}
+
 	st, err := store.Open(cfg.DBPath)
 	if err != nil {
 		log.Fatalf("store: %v", err)
@@ -257,9 +264,9 @@ func exampleConfig(args []string) {
 	// Named chains — explicit fallback sequences that bypass the pool classifier.
 	// Send model="chain:fast" or model="chain:smart" to use them.
 	cfg.Chains = map[string][]string{
-		"fast":    {"openrouter:openai/gpt-5.6-luna", "agnes:agnes-2.0-flash"},
-		"smart":   {"charm:deepseek-v4-flash", "xkiro:minimax/m3"},
-		"cheapest":{"agnes:agnes-2.0-flash"},
+		"fast":     {"openrouter:openai/gpt-5.6-luna", "agnes:agnes-2.0-flash"},
+		"smart":    {"charm:deepseek-v4-flash", "xkiro:minimax/m3"},
+		"cheapest": {"agnes:agnes-2.0-flash"},
 	}
 	// Tier ordering per pool — cheapest first. The router tries the cheapest
 	// tier that can handle the request; 429/5xx escalates to the next tier.

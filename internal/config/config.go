@@ -228,6 +228,11 @@ type FallbackCfg struct {
 	// than "timeout" because timeout_s already means something else here (the
 	// per-attempt TTFB deadline). 0 disables escalation.
 	ProviderLockoutS int `yaml:"provider_lockout_s"`
+	// RetryTransientMax is how many times a non-streamed attempt that received
+	// a 502/503/504 (with no Retry-After) is retried in place on the same key
+	// before falling through to normal fallback. A gateway blip shouldn't burn
+	// the next candidate's quota. 0 disables; values above 3 are clamped to 3.
+	RetryTransientMax int `yaml:"retry_transient_max"`
 }
 
 // Config is the whole router configuration.
@@ -239,6 +244,7 @@ type Config struct {
 	RouterKey         string              `yaml:"router_key"`
 	InsecureNoAuth    bool                `yaml:"insecure_no_auth"`
 	CatalogURL        string              `yaml:"catalog_url"`
+	QuotaFile         string              `yaml:"quota_file"`
 	Default           string              `yaml:"default"`
 	Pools             map[string][]string `yaml:"pools"`
 	Chains            map[string][]string `yaml:"chains"`

@@ -14,6 +14,8 @@ It's plain Go, no framework, one binary. SQLite keeps the request log.
 - **Non-OpenAI upstreams.** Most providers speak OpenAI's format. For Anthropic and Gemini, set `api_mode` on the provider and the router translates the request and response for you.
 - **Dashboard.** A read/write web UI: watch requests live, see where they routed, edit config, add providers, build pools. Unlocks with your `router_key`, so it's safe to reach over a private network.
 - **Request log.** Every request and attempt lands in SQLite, so you can go back and see exactly what happened and what it cost.
+- **Quota-aware pool ordering.** Point `quota_file` at a JSON file of per-provider remaining-quota snapshots (e.g. written by a plan tracker) and pools reorder themselves: a provider running low sorts after one with headroom, an exhausted one sinks further. Explicit chains bypass it.
+- **Hardened by default.** Loopback-only listen, security headers on every response, constant-time key comparison, and per-IP auth backoff (repeated bad keys get 429 + Retry-After instead of unlimited guesses).
 
 ## Quick start
 

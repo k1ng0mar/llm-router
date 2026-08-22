@@ -250,7 +250,7 @@ func (r *Router) resolveEntries(pool string, payload map[string]any) []string {
 
 	// auto or empty → use pool entries, tier-ordered if configured
 	if model == "" || model == "auto" {
-		return r.cfg.TierSortedEntries(pool)
+		return r.quotaOrdered(r.cfg.TierSortedEntries(pool))
 	}
 
 	// chain:<name> → named chain (explicit order; NOT tier-reordered)
@@ -260,7 +260,7 @@ func (r *Router) resolveEntries(pool string, payload map[string]any) []string {
 			return chain
 		}
 		// unknown chain → fall back to pool (still tier-ordered)
-		return r.cfg.TierSortedEntries(pool)
+		return r.quotaOrdered(r.cfg.TierSortedEntries(pool))
 	}
 
 	// comma-separated → inline chain (explicit order)
@@ -283,7 +283,18 @@ func (r *Router) resolveEntries(pool string, payload map[string]any) []string {
 	}
 
 	// unknown model string → fall back to pool (still tier-ordered)
-	return r.cfg.TierSortedEntries(pool)
+	return r.quotaOrdered(r.cfg.TierSortedEntries(pool))
+}
+
+// quotaOrdered reorders pool entries by their provider's remaining quota
+// (see quota.go). Explicit chains and single-model refs bypass this — only
+// pool-driven resolution consults the quota file, and only when one is set.
+func (r *Router) quotaOrdered(entries []string) []string {
+	data := quotaState()
+	if data == nil {
+		return entries
+	}
+	return QuotaSortedEntries(entries, data, r.now())
 }
 
 // Route runs the candidates through the capability gate, then attempts each in
@@ -560,6 +571,44 @@ candidateLoop:
 				res.Status = att.Status
 				res.Resp = resp
 				return res, nil
+			case isTransientStatus(att.Status) && !streamRequested(payload):
+				// A single 502/503/504 is often a blip (LB hiccup, brief deploy),
+				// not a verdict on the candidate. Retry the SAME key in place —
+				// bounded, jittered, never for streamed requests (the body may
+				// have started arriving) and never when upstream sent an explicit
+				// Retry-After. Only after the in-place retries are spent does the
+				// attempt fall through to normal fallback handling.
+				retried := false
+				for i := 0; i < RetryTransientMax(r.cfg.GetFallback()); i++ {
+					if ra := parseRetryAfter(resp.Header); ra > 0 {
+						break // upstream told us when to come back; respect it
+					}
+					if ctx.Err() != nil {
+						break // client gone mid-retry
+					}
+					time.Sleep(transientBackoff(i))
+					resp2, err2 := r.client.Do(ctx, &provider.Upstream{Name: pName, BaseURL: upBaseURL, Keys: keys, APIMode: pr.APIMode}, key, upstreamPayload)
+					resp.Body.Close()
+					if err2 != nil {
+						att.Err = describeAttemptError(err2, attemptTimeout, ctx)
+						break // treat as a plain failure; key loop continues below
+					}
+					att.LatencyMs = int(time.Since(start).Milliseconds())
+					att.Status = resp2.StatusCode
+					resp = resp2
+					retried = true
+					if resp.StatusCode == 200 || !isTransientStatus(resp.StatusCode) {
+						break
+					}
+				}
+				if retried && att.Status == 200 {
+					picker.MarkSuccess(keyIdx)
+					r.clearBreaker(refKey)
+					res.Status = att.Status
+					res.Resp = resp
+					return res, nil
+				}
+				fallthrough
 			default: // any non-200 (4xx, 5xx, 3xx) — record and fall back
 				body = readErrBody(resp)
 				att.Err = body

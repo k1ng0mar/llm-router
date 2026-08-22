@@ -15,6 +15,15 @@ insecure_no_auth: false
 # Source for the model catalog (model names, context windows, capabilities).
 catalog_url: https://models.dev/api.json
 
+# Optional: per-provider remaining-quota snapshots for quota-aware pool
+# ordering. Point this at a JSON file a plan tracker keeps fresh, e.g.
+#   {"gemini": {"percent_left": 40, "reset_at": "2026-08-22T18:00:00Z"}}
+# Pool entries whose provider is running low (<25% left) sort after providers
+# with headroom; exhausted ones sink further. Providers absent from the file
+# are unpenalized, declared order is kept within each bucket, and explicit
+# chains / single-model refs bypass it entirely. Leave empty to disable.
+quota_file: ""
+
 # The pool used when a request doesn't say which one it wants.
 default: chat
 
@@ -148,7 +157,14 @@ fallback:
   # failed once, not six times. Set the threshold to 0 to disable escalation.
   provider_failure_threshold: 5
 
-  # The escalated window, in seconds (10 minutes). Called "lockout" rather than
-  # "timeout" because timeout_s above already means the per-attempt TTFB
+  # The escalated window, in seconds (10 minutes). Called "lockout" rather
+  # than "timeout" because timeout_s above already means the per-attempt TTFB
   # deadline. 0 also disables escalation.
   provider_lockout_s: 600
+
+  # In-place retry for gateway blips. A non-streamed attempt answered with a
+  # 502/503/504 (and no Retry-After) is retried on the SAME key this many times
+  # — with jittered backoff — before falling through to the next key/provider.
+  # A blip shouldn't burn the next candidate's quota. 0 disables (the default);
+  # values above 3 are clamped.
+  retry_transient_max: 0

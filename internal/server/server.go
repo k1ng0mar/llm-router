@@ -7,6 +7,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/rand"
+	"crypto/subtle"
 	"embed"
 	"encoding/hex"
 	"encoding/json"
@@ -64,11 +65,12 @@ func init() {
 
 // Server wires handlers to the router, store, config, and catalog gate.
 type Server struct {
-	cfg    *config.Config
-	store  *store.Store
-	router *route.Router
-	client *provider.Client
-	gate   *catalog.Gate
+	cfg       *config.Config
+	store     *store.Store
+	router    *route.Router
+	client    *provider.Client
+	gate      *catalog.Gate
+	authFails *authBackoffTracker
 }
 
 // New builds a server. client and gate may be nil.
@@ -79,11 +81,17 @@ func New(cfg *config.Config, st *store.Store, r *route.Router, g *catalog.Gate) 
 	// The describe hop gets the same per-attempt TTFB bound as the main path;
 	// http.DefaultClient has no timeout at all.
 	ttfb := time.Duration(cfg.GetFallback().TimeoutS) * time.Second
-	return &Server{cfg: cfg, store: st, router: r, client: provider.NewClientWithTTFB(ttfb), gate: g}
+	return &Server{cfg: cfg, store: st, router: r, client: provider.NewClientWithTTFB(ttfb), gate: g, authFails: newAuthBackoffTracker()}
 }
 
-// Handler returns the multiplexer for the whole HTTP surface.
+// Handler returns the multiplexer for the whole HTTP surface, wrapped in the
+// security-headers and auth-backoff middleware.
 func (s *Server) Handler() http.Handler {
+	return s.securityHeaders(s.authBackoff(s.buildMux()))
+}
+
+// buildMux registers every route on a fresh ServeMux.
+func (s *Server) buildMux() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("POST /v1/chat/completions", s.handleChat)
 	mux.HandleFunc("GET /healthz", s.handleHealthz)
@@ -188,7 +196,17 @@ func (s *Server) authorized(r *http.Request) bool {
 		h := strings.TrimSpace(r.Header.Get("Authorization"))
 		// Case-insensitive scheme, exact comparison of the secret.
 		h = strings.TrimPrefix(strings.ToLower(h), "bearer ")
-		return h == s.cfg.RouterKey
+		if h == s.cfg.RouterKey {
+			s.clearAuthFailures(r)
+			return true
+		}
+		// Only real attempts count toward the backoff — an absent credential is
+		// usually a misconfigured client probe, not a brute-force try. Constant-
+		// time compare so the equality check itself leaks nothing about the key.
+		if h != "" && subtle.ConstantTimeCompare([]byte(h), []byte(s.cfg.RouterKey)) != 1 {
+			s.noteAuthFailure(r)
+		}
+		return false
 	}
 	// No router key configured: a request is only permitted when the operator
 	// has explicitly opted in. An empty key must NEVER silently open everything.
@@ -444,13 +462,13 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 	// copy upstream headers, stripping hop-by-hop and transport-level headers
 	// that Go's http.Server manages itself or that cause passthrough issues
 	skipHeaders := map[string]bool{
-		"Content-Length":      true,
-		"Transfer-Encoding":   true,
-		"Connection":          true,
-		"Server":              true,
-		"Date":                true,
-		"Set-Cookie":          true, // don't leak upstream cookies to router clients
-		"Content-Encoding":    true, // Go transport already decoded unless we re-encode
+		"Content-Length":    true,
+		"Transfer-Encoding": true,
+		"Connection":        true,
+		"Server":            true,
+		"Date":              true,
+		"Set-Cookie":        true, // don't leak upstream cookies to router clients
+		"Content-Encoding":  true, // Go transport already decoded unless we re-encode
 	}
 	for k := range res.Resp.Header {
 		if skipHeaders[strings.ToLower(k)] || skipHeaders[k] {
@@ -645,8 +663,8 @@ func (s *Server) describeImages(ctx context.Context, payload map[string]any, mes
 			key = up.Keys[0]
 		}
 		hop := map[string]any{
-			"model":    model,
-			"messages": hopMessages,
+			"model":      model,
+			"messages":   hopMessages,
 			"max_tokens": 2048,
 			"stream":     false,
 		}
@@ -1056,9 +1074,9 @@ func (s *Server) handleUpdateProvider(w http.ResponseWriter, r *http.Request) {
 	}
 	name := r.PathValue("name")
 	var body struct {
-		ModelLimits    map[string]int                 `json:"model_limits"`
-		DisabledModels []string                       `json:"disabled_models"`
-		MediaPolicies  map[string]config.MediaPolicy  `json:"media_policies"`
+		ModelLimits    map[string]int                `json:"model_limits"`
+		DisabledModels []string                      `json:"disabled_models"`
+		MediaPolicies  map[string]config.MediaPolicy `json:"media_policies"`
 	}
 	if err := json.NewDecoder(io.LimitReader(r.Body, 1<<20)).Decode(&body); err != nil {
 		writeJSON(w, http.StatusBadRequest, map[string]any{"error": err.Error()})
@@ -1329,8 +1347,12 @@ func (s *Server) handleProviderModels(w http.ResponseWriter, r *http.Request) {
 	bodyBytes, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
 	if resp.StatusCode == 200 && s.store != nil {
 		var data struct {
-			Data   []struct{ ID string `json:"id"` } `json:"data"`
-			Models []struct{ ID string `json:"id"` } `json:"models"`
+			Data []struct {
+				ID string `json:"id"`
+			} `json:"data"`
+			Models []struct {
+				ID string `json:"id"`
+			} `json:"models"`
 		}
 		if json.Unmarshal(bodyBytes, &data) == nil {
 			var ids []string
@@ -1484,8 +1506,12 @@ func (s *Server) fetchAndCacheModels(name string, p *config.Provider) {
 	}
 	bodyBytes, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
 	var data struct {
-		Data   []struct{ ID string `json:"id"` } `json:"data"`
-		Models []struct{ ID string `json:"id"` } `json:"models"`
+		Data []struct {
+			ID string `json:"id"`
+		} `json:"data"`
+		Models []struct {
+			ID string `json:"id"`
+		} `json:"models"`
 	}
 	if json.Unmarshal(bodyBytes, &data) != nil {
 		log.Printf("fetchAndCacheModels %s: invalid JSON from /models", name)
