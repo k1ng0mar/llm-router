@@ -131,6 +131,36 @@ func (r *Router) now() time.Time {
 	return time.Now()
 }
 
+// Status is a redacted snapshot of live key/breaker health for the dashboard.
+func (r *Router) Status() map[string]any {
+	now := r.now()
+	r.pMu.Lock()
+	cooling, dead, total := 0, 0, 0
+	for _, p := range r.pickers {
+		if p == nil {
+			continue
+		}
+		total += p.KeyCount()
+		cooling += p.CoolingCount(now)
+		dead += p.DeadCount()
+	}
+	r.pMu.Unlock()
+	r.bMu.Lock()
+	breakers := 0
+	for _, st := range r.breakers {
+		if st != nil && now.Before(st.until) {
+			breakers++
+		}
+	}
+	r.bMu.Unlock()
+	return map[string]any{
+		"keysCooling":     cooling,
+		"keysDead":        dead,
+		"keyTotal":        total,
+		"providersCooling": breakers,
+	}
+}
+
 // breakerFor reports a candidate's cooldown state: when it may be dialed again
 // and how long its current failure streak is. Expired entries are kept rather
 // than deleted so the streak survives to escalate; clearBreaker and eviction
@@ -297,6 +327,15 @@ func (r *Router) quotaOrdered(entries []string) []string {
 	return QuotaSortedEntries(entries, data, r.now())
 }
 
+// poolContextFloor returns the advertised context ceiling for a pool, or 0 when
+// the pool has no override. The advertised ceiling is what the /v1/models
+// endpoint exposes (pool_context in config); when set, candidates whose real
+// context is below it are skipped in RouteExcluding so a pool that promises
+// 512k/1m never silently routes to a 128k model.
+func (r *Router) poolContextFloor(pool string) int {
+	return r.cfg.GetPoolContext()[pool]
+}
+
 // Route runs the candidates through the capability gate, then attempts each in
 // order with per-key rotation. Every non-200 status, plus transport errors and
 // TTFB timeouts, rotates onward to the next key and then the next candidate; no
@@ -436,6 +475,21 @@ candidateLoop:
 			att.Status = 0
 			att.Err = "excluded: " + reason
 			continue
+		}
+
+		// Context-floor: if the pool advertises a context ceiling (pool_context
+		// override) and this candidate's real context is below it, skip it so a
+		// small-context model never silently serves a pool that promises more.
+		// This is what makes a 512k/1m advertised pool actually route only to
+		// models that can hold that much — the rest fall through to the next
+		// candidate. Unknown models (real ctx 0) are kept: they fail open.
+		if floor := r.poolContextFloor(pool); floor > 0 {
+			if realCtx := r.gate.ContextWindow(ref); realCtx > 0 && realCtx < floor {
+				att := ap(pName, model, "", "router")
+				att.Status = 0
+				att.Err = fmt.Sprintf("excluded: context %d below pool floor %d", realCtx, floor)
+				continue
+			}
 		}
 
 		keys := pr.Keys

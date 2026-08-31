@@ -249,6 +249,7 @@ type Config struct {
 	Pools             map[string][]string `yaml:"pools"`
 	Chains            map[string][]string `yaml:"chains"`
 	Tiers             map[string][]string `yaml:"tiers"`
+	PoolContext       map[string]int      `yaml:"pool_context,omitempty"`
 	AllowDirectVision bool                `yaml:"allow_direct_vision"`
 	Vision            []string            `yaml:"vision"`
 	Providers         Providers           `yaml:"providers"`
@@ -268,6 +269,7 @@ func DefaultConfig() *Config {
 			"code":  {},
 			"media": {},
 		},
+		PoolContext:       map[string]int{},
 		Chains:            map[string][]string{},
 		Tiers:             map[string][]string{},
 		AllowDirectVision: true,
@@ -954,6 +956,19 @@ func (c *Config) GetPools() map[string][]string {
 	return out
 }
 
+// GetPoolContext returns a copy of the per-pool advertised context overrides.
+// Keys are pool names plus the special "router"/"auto" aliases. A missing key
+// means "compute from the pool's models" (see Server.poolContext).
+func (c *Config) GetPoolContext() map[string]int {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	out := make(map[string]int, len(c.PoolContext))
+	for k, v := range c.PoolContext {
+		out[k] = v
+	}
+	return out
+}
+
 // GetClassifierHeuristics returns a shallow copy of the heuristics map.
 func (c *Config) GetClassifierHeuristics() map[string][]string {
 	c.mu.RLock()
@@ -1088,6 +1103,7 @@ func (c *Config) ReloadFrom(r io.Reader) error {
 	c.Pools = fresh.Pools
 	c.Chains = fresh.Chains
 	c.Tiers = fresh.Tiers
+	c.PoolContext = fresh.PoolContext
 	c.AllowDirectVision = fresh.AllowDirectVision
 	c.Vision = fresh.Vision
 	c.Providers = fresh.Providers
@@ -1101,6 +1117,36 @@ func (c *Config) GetFallback() FallbackCfg {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
 	return c.Fallback
+}
+
+// SetFallback persists failover knobs. Zero values keep the current field.
+func (c *Config) SetFallback(in FallbackCfg) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	cur := c.Fallback
+	if in.TimeoutS > 0 {
+		cur.TimeoutS = in.TimeoutS
+	}
+	if in.Strategy != "" {
+		cur.Strategy = in.Strategy
+	}
+	if in.KeyCooldownS > 0 {
+		cur.KeyCooldownS = in.KeyCooldownS
+	}
+	if in.ProviderCooldownS > 0 {
+		cur.ProviderCooldownS = in.ProviderCooldownS
+	}
+	if in.ProviderFailureThreshold > 0 {
+		cur.ProviderFailureThreshold = in.ProviderFailureThreshold
+	}
+	if in.ProviderLockoutS > 0 {
+		cur.ProviderLockoutS = in.ProviderLockoutS
+	}
+	if in.RetryTransientMax > 0 {
+		cur.RetryTransientMax = in.RetryTransientMax
+	}
+	c.Fallback = cur
+	return c.persistNoLock()
 }
 
 // GetTierSortedEntries returns tier-sorted entries for a pool.

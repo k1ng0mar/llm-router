@@ -167,6 +167,19 @@ func (g *Gate) HasTools(model string) bool {
 	return info.HasTools()
 }
 
+// ContextWindow reports the effective context window for a model ref
+// ("provider:model"), or 0 when the model is unknown. 0 lets callers treat
+// unknown models as "no advertised limit" rather than guessing.
+func (g *Gate) ContextWindow(model string) int {
+	g.mu.RLock()
+	defer g.mu.RUnlock()
+	info, ok := g.lookup(model)
+	if !ok {
+		return 0
+	}
+	return info.Ctx()
+}
+
 // Refresh fetches the remote catalog and merges it. Failures never clear state.
 func (g *Gate) Refresh(ctx context.Context, url string, client *http.Client) error {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)

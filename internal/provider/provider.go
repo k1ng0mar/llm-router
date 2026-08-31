@@ -241,6 +241,42 @@ func (p *KeyPicker) SetCooldown(d time.Duration) { p.defaultCD = d }
 // SetRetryAfterCap caps how long a Retry-After value can keep a key down.
 func (p *KeyPicker) SetRetryAfterCap(d time.Duration) { p.retryAfterCap = d }
 
+// KeyCount is the configured key stack size (including dead/cooling).
+func (p *KeyPicker) KeyCount() int {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return len(p.keys)
+}
+
+// CoolingCount is how many keys are currently in a 429 cooldown window.
+func (p *KeyPicker) CoolingCount(now time.Time) int {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	n := 0
+	for i := range p.keys {
+		if p.dead[i] {
+			continue
+		}
+		if !p.failUntil[i].IsZero() && now.Before(p.failUntil[i]) {
+			n++
+		}
+	}
+	return n
+}
+
+// DeadCount is how many keys are 401-dead.
+func (p *KeyPicker) DeadCount() int {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	n := 0
+	for _, d := range p.dead {
+		if d {
+			n++
+		}
+	}
+	return n
+}
+
 // Next returns the next eligible key index. ok=false when all keys are dead/cooling.
 func (p *KeyPicker) Next(now time.Time) (int, string, bool) {
 	return p.NextExcluding(now, nil)

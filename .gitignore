@@ -19,3 +19,8 @@ logs/
 # Local dev
 .env
 .DS_Store
+
+# OAuth bridge helpers + runtime state
+quota.json
+router.yaml.bak
+.db-backup/

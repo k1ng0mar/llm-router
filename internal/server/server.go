@@ -101,11 +101,13 @@ func (s *Server) buildMux() http.Handler {
 	mux.HandleFunc("GET /api/stats", s.handleStats)
 	mux.HandleFunc("GET /api/usage/models", s.handleModelUsage)
 	mux.HandleFunc("GET /api/config", s.handleGetConfig)
+	mux.HandleFunc("GET /api/status", s.handleStatus)
 	mux.HandleFunc("POST /api/config/default", s.handleSetDefault)
 	mux.HandleFunc("POST /api/config/pools", s.handleSetPool)
 	mux.HandleFunc("POST /api/config/providers", s.handleSetProvider)
 	mux.HandleFunc("PUT /api/config/providers/{name}", s.handleUpdateProvider)
 	mux.HandleFunc("POST /api/config/keys", s.handleSetKeys)
+	mux.HandleFunc("POST /api/config/fallback", s.handleSetFallback)
 	mux.HandleFunc("POST /api/config/toggle", s.handleToggleProvider)
 	mux.HandleFunc("POST /api/config/models/toggle", s.handleToggleModel)
 	mux.HandleFunc("POST /api/config/chains", s.handleSetChain)
@@ -167,9 +169,10 @@ func (s *Server) handleListModels(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	type model struct {
-		ID      string `json:"id"`
-		Object  string `json:"object"`
-		OwnedBy string `json:"owned_by"`
+		ID            string `json:"id"`
+		Object        string `json:"object"`
+		OwnedBy       string `json:"owned_by"`
+		ContextLength int    `json:"context_length,omitempty"`
 	}
 	out := []model{
 		{ID: "router", Object: "model", OwnedBy: "llm-router"},
@@ -180,10 +183,61 @@ func (s *Server) handleListModels(w http.ResponseWriter, r *http.Request) {
 		pools = append(pools, name)
 	}
 	sort.Strings(pools) // stable ordering so a client's cache doesn't churn
+	poolCtx := s.cfg.GetPoolContext()
 	for _, name := range pools {
-		out = append(out, model{ID: name, Object: "model", OwnedBy: "llm-router"})
+		ctx := s.poolContext(name)
+		m := model{ID: name, Object: "model", OwnedBy: "llm-router"}
+		if override, ok := poolCtx[name]; ok && override > 0 {
+			ctx = override
+		}
+		if ctx > 0 {
+			m.ContextLength = ctx
+		}
+		out = append(out, m)
+	}
+	// "router" and "auto" are aliases for "you pick": no fixed limit of their
+	// own — the ceiling depends on which pool the classifier picks, which isn't
+	// knowable at listing time. So they advertise no context_length unless an
+	// explicit pool_context["router"] / ["auto"] override says otherwise. With
+	// no field, clients fall back to their own default instead of being told a
+	// number that may not match the actual pool.
+	for _, alias := range []string{"router", "auto"} {
+		if override, ok := poolCtx[alias]; ok && override > 0 {
+			if alias == "router" {
+				out[0].ContextLength = override
+			} else {
+				out[1].ContextLength = override
+			}
+		}
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"object": "list", "data": out})
+}
+
+// poolContext returns the effective context window for a pool: the minimum
+// context across the pool's entries, since any of them may serve the request.
+// Entries whose model is unknown to the gate are skipped (they advertise no
+// limit), so a pool with at least one known model reports a real ceiling.
+func (s *Server) poolContext(pool string) int {
+	entries := s.cfg.GetPools()[pool]
+	minCtx := 0
+	for _, ref := range entries {
+		ref = strings.TrimSpace(ref)
+		if ref == "" {
+			continue
+		}
+		prov, model, err := s.cfg.Resolve(ref)
+		if err != nil {
+			continue
+		}
+		ctx := s.gate.ContextWindow(prov + ":" + model)
+		if ctx <= 0 {
+			continue // unknown model advertises no limit
+		}
+		if minCtx == 0 || ctx < minCtx {
+			minCtx = ctx
+		}
+	}
+	return minCtx
 }
 
 func (s *Server) handleHealthz(w http.ResponseWriter, r *http.Request) {
@@ -991,6 +1045,53 @@ func (s *Server) handleGetConfig(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, s.cfg.Redacted())
+}
+
+func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
+	if !s.authorized(r) {
+		writeJSON(w, http.StatusUnauthorized, map[string]any{"error": map[string]string{"message": "unauthorized"}})
+		return
+	}
+	out := map[string]any{"keysCooling": 0, "keysDead": 0, "keyTotal": 0, "providersCooling": 0}
+	if s.router != nil {
+		for k, v := range s.router.Status() {
+			out[k] = v
+		}
+	}
+	writeJSON(w, http.StatusOK, out)
+}
+
+func (s *Server) handleSetFallback(w http.ResponseWriter, r *http.Request) {
+	if !s.authorized(r) {
+		writeJSON(w, http.StatusUnauthorized, map[string]any{"error": map[string]string{"message": "unauthorized"}})
+		return
+	}
+	var body struct {
+		TimeoutS                 int    `json:"timeout_s"`
+		Strategy                 string `json:"strategy"`
+		KeyCooldownS             int    `json:"key_cooldown_s"`
+		ProviderCooldownS        int    `json:"provider_cooldown_s"`
+		ProviderFailureThreshold int    `json:"provider_failure_threshold"`
+		ProviderLockoutS         int    `json:"provider_lockout_s"`
+		RetryTransientMax        int    `json:"retry_transient_max"`
+	}
+	if err := json.NewDecoder(io.LimitReader(r.Body, 1<<20)).Decode(&body); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]any{"error": err.Error()})
+		return
+	}
+	if err := s.cfg.SetFallback(config.FallbackCfg{
+		TimeoutS:                 body.TimeoutS,
+		Strategy:                 body.Strategy,
+		KeyCooldownS:             body.KeyCooldownS,
+		ProviderCooldownS:        body.ProviderCooldownS,
+		ProviderFailureThreshold: body.ProviderFailureThreshold,
+		ProviderLockoutS:         body.ProviderLockoutS,
+		RetryTransientMax:        body.RetryTransientMax,
+	}); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]any{"error": err.Error()})
+		return
+	}
+	writeJSON(w, http.StatusOK, s.cfg.GetFallback())
 }
 
 func (s *Server) handleSetDefault(w http.ResponseWriter, r *http.Request) {
