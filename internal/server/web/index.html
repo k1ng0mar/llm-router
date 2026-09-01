@@ -165,13 +165,24 @@ table { border-collapse: collapse; }
   <p class="text-sm text-on-surface-variant">Custom providers default to the OpenAI-compatible <code class="font-mono text-xs bg-surface-container px-1 rounded">/v1/chat/completions</code> convention. Pick <code class="font-mono text-xs bg-surface-container px-1 rounded">Anthropic</code> or <code class="font-mono text-xs bg-surface-container px-1 rounded">Gemini</code> to talk to those native APIs directly.</p>
   <div class="border border-outline-variant rounded p-6 bg-surface-container-low flex flex-col gap-3">
     <label class="text-sm flex flex-col gap-1">Name<span class="text-xs text-on-surface-variant">how the provider appears in pools/chains</span><input id="new-prov-name" placeholder="e.g. my-provider" class="border border-outline-variant bg-white rounded px-3 py-2 text-sm"></label>
-    <label class="text-sm flex flex-col gap-1">Base URL<span class="text-xs text-on-surface-variant">OpenAI: the router appends /v1/chat/completions. Anthropic/Gemini: use the API root (e.g. https://api.anthropic.com)</span><input id="new-prov-url" placeholder="https://api.example.com/v1" class="border border-outline-variant bg-white rounded px-3 py-2 text-sm font-mono"></label>
-    <label class="text-sm flex flex-col gap-1">API Mode<span class="text-xs text-on-surface-variant">wire format the upstream speaks</span><select id="new-prov-mode" class="border border-outline-variant bg-white rounded px-3 py-2 text-sm">
-      <option value="openai">OpenAI-compatible</option>
-      <option value="anthropic">Anthropic (/v1/messages)</option>
-      <option value="gemini">Gemini (generateContent)</option>
-    </select></label>
-    <label class="text-sm flex flex-col gap-1">API Keys<span class="text-xs text-on-surface-variant">one per line — optional for keyless/local providers</span><textarea id="new-prov-keys" placeholder="sk-..." class="border border-outline-variant bg-white rounded px-3 py-2 text-sm font-mono" rows="3"></textarea></label>
+    <div class="flex gap-2">
+      <button type="button" id="new-prov-mode-single" onclick="setNewProvMode('single')" class="text-sm px-3 py-1 rounded bg-primary text-on-primary">Single Endpoint</button>
+      <button type="button" id="new-prov-mode-links" onclick="setNewProvMode('links')" class="text-sm px-3 py-1 rounded border border-outline-variant hover:bg-surface-container">Deployment Links</button>
+    </div>
+    <div id="new-prov-single-section">
+      <label class="text-sm flex flex-col gap-1">Base URL<span class="text-xs text-on-surface-variant">OpenAI: the router appends /v1/chat/completions. Anthropic/Gemini: use the API root (e.g. https://api.anthropic.com)</span><input id="new-prov-url" placeholder="https://api.example.com/v1" class="border border-outline-variant bg-white rounded px-3 py-2 text-sm font-mono"></label>
+      <label class="text-sm flex flex-col gap-1">API Mode<span class="text-xs text-on-surface-variant">wire format the upstream speaks</span><select id="new-prov-mode" class="border border-outline-variant bg-white rounded px-3 py-2 text-sm">
+        <option value="openai">OpenAI-compatible</option>
+        <option value="anthropic">Anthropic (/v1/messages)</option>
+        <option value="gemini">Gemini (generateContent)</option>
+      </select></label>
+      <label class="text-sm flex flex-col gap-1">API Keys<span class="text-xs text-on-surface-variant">one per line — optional for keyless/local providers</span><textarea id="new-prov-keys" placeholder="sk-..." class="border border-outline-variant bg-white rounded px-3 py-2 text-sm font-mono" rows="3"></textarea></label>
+    </div>
+    <div id="new-prov-links-section" class="hidden flex flex-col gap-2">
+      <p class="text-xs text-on-surface-variant">Each deployment URL serves exactly one model. The router auto-discovers the model at each link.</p>
+      <div id="new-prov-links-list" class="flex flex-col gap-2"></div>
+      <button type="button" onclick="addNewProvLink()" class="text-sm text-primary hover:underline flex items-center gap-1 self-start"><span class="material-symbols-outlined text-base">add</span>Add Link</button>
+    </div>
     <div class="flex gap-3 mt-2">
       <button onclick="addProvider()" class="bg-primary text-on-primary text-sm px-4 py-2 rounded hover:opacity-90">Add Provider</button>
       <button onclick="showPage('providers')" class="border border-outline-variant text-sm px-4 py-2 rounded hover:bg-surface-container">Cancel</button>
@@ -1715,60 +1726,99 @@ function renderProviders() {
 async function toggleProvider(name, enabled) { const r = await api('/api/config/toggle', {method:'POST', body:JSON.stringify({name, enabled})}); if(r.ok) await loadConfig(); }
 function openProvDetail(name) {
   const p = currentConfig.providers?.[name]; if (!p) return;
+  const hasLinks = p.deployment_links && p.deployment_links.length > 0;
   // keys from API are plain strings; normalize for the detail panel
-  // Labels come from the server (provider.key_labels, index-aligned with keys).
-  // They used to be invented client-side as "Key N", which is why a nickname
-  // never survived reopening the panel.
   const labels = p.key_labels || [];
-  // _origIdx is the key's index on the server. It travels with the row so a
-  // removal names the surviving keys explicitly ("__KEEP__:<n>") instead of
-  // relying on positional consumption, which deleted the wrong key.
   const keys = (p.keys || []).map((k, i) => typeof k === 'string'
     ? {nick: labels[i] || '', value: k, _origIdx: i}
     : {nick: (k.nick || labels[i] || ''), value: (k.value || ''), _origIdx: i});
-  currentProvDetail = {name, baseUrl: p.base_url||'', keys, enabled: p.enabled, accountId: p.account_id||'', apiMode: p.api_mode||'', modelLimits: p.model_limits||{}, disabledModels: p.disabled_models||[], mediaPolicies: p.media_policies||{}, fetchedModels: []};
+  const deploymentLinks = (p.deployment_links || []).map((dl, i) => ({
+    url: dl.url || '',
+    key: dl.key || '',
+    _origIdx: i
+  }));
+  currentProvDetail = {name, baseUrl: p.base_url||'', keys, enabled: p.enabled, accountId: p.account_id||'', apiMode: p.api_mode||'', modelLimits: p.model_limits||{}, disabledModels: p.disabled_models||[], mediaPolicies: p.media_policies||{}, fetchedModels: [], hasLinks, deploymentLinks};
   document.getElementById('prov-detail-name').textContent = name;
-  const keyCount = keys.length;
   const isLocal = (p.base_url||'').includes('127.0.0.1') || (p.base_url||'').includes('localhost');
-  const keyRows = keys.length > 0 ? keys.map((k,i) => keyRowHTML(k, i)).join('')
-    : '<tr><td colspan="3" class="py-3 text-sm text-on-surface-variant">No keys configured.</td></tr>';
-  document.getElementById('prov-detail-body').innerHTML = `
-    <div class="border border-outline-variant rounded p-4 bg-surface-container-low flex flex-col gap-3">
-      <h3 class="text-xs uppercase text-on-surface-variant">General Configuration</h3>
-      <label class="text-sm flex flex-col gap-1">Provider Name<input value="${esc(name)}" class="border border-outline-variant bg-white rounded px-3 py-2 text-sm" readonly></label>
-      <label class="text-sm flex flex-col gap-1">Base URL<input id="prov-detail-url" value="${esc(p.base_url||'')}" class="border border-outline-variant bg-white rounded px-3 py-2 text-sm font-mono"></label>
-      <label class="text-sm flex flex-col gap-1">API Mode<span class="text-xs text-on-surface-variant">wire format the upstream speaks</span><select id="prov-detail-mode" class="border border-outline-variant bg-white rounded px-3 py-2 text-sm">
-        <option value="openai" ${(p.api_mode||'')==='openai'||(!p.api_mode)?'selected':''}>OpenAI-compatible</option>
-        <option value="anthropic" ${p.api_mode==='anthropic'?'selected':''}>Anthropic (/v1/messages)</option>
-        <option value="gemini" ${p.api_mode==='gemini'?'selected':''}>Gemini (generateContent)</option>
-      </select></label>
-      <label class="text-sm flex flex-col gap-1 ${p.account_id || (p.base_url||'').includes('{account_id}') ? '' : 'hidden'}" id="prov-account-id-label">Account ID<span class="text-xs text-on-surface-variant">Required for Cloudflare Workers AI — used to fill {account_id} in the base URL</span><input id="prov-detail-account-id" value="${esc(p.account_id||'')}" placeholder="e.g. abc123def456" class="border border-outline-variant bg-white rounded px-3 py-2 text-sm font-mono"></label>
-      <div class="flex items-center justify-between">
-        <span class="text-sm">Enabled</span>
-        <div id="prov-detail-toggle" class="toggle-sw ${p.enabled?'on':''}" onclick="toggleProvDetailEnabled()"></div>
+
+  if (hasLinks) {
+    // Deployment-links provider: show link editor
+    const linkRows = deploymentLinks.length > 0 ? deploymentLinks.map((dl,i) => linkRowHTML(dl, i)).join('')
+      : '<tr><td colspan="3" class="py-3 text-sm text-on-surface-variant">No deployment links configured.</td></tr>';
+    document.getElementById('prov-detail-body').innerHTML = `
+      <div class="border border-outline-variant rounded p-4 bg-surface-container-low flex flex-col gap-3">
+        <h3 class="text-xs uppercase text-on-surface-variant">General Configuration</h3>
+        <label class="text-sm flex flex-col gap-1">Provider Name<input value="${esc(name)}" class="border border-outline-variant bg-white rounded px-3 py-2 text-sm" readonly></label>
+        <label class="text-sm flex flex-col gap-1">API Mode<span class="text-xs text-on-surface-variant">wire format the upstream speaks</span><select id="prov-detail-mode" class="border border-outline-variant bg-white rounded px-3 py-2 text-sm">
+          <option value="openai" ${(p.api_mode||'')==='openai'||(!p.api_mode)?'selected':''}>OpenAI-compatible</option>
+          <option value="anthropic" ${p.api_mode==='anthropic'?'selected':''}>Anthropic (/v1/messages)</option>
+          <option value="gemini" ${p.api_mode==='gemini'?'selected':''}>Gemini (generateContent)</option>
+        </select></label>
+        <div class="flex items-center justify-between">
+          <span class="text-sm">Enabled</span>
+          <div id="prov-detail-toggle" class="toggle-sw ${p.enabled?'on':''}" onclick="toggleProvDetailEnabled()"></div>
+        </div>
       </div>
-      ${isLocal ? '<p class="text-xs text-on-surface-variant">Local provider -- keys not required.</p>' : ''}
-    </div>
-    <div class="border border-outline-variant rounded p-4 bg-surface-container-low flex flex-col gap-3">
-      <div class="flex justify-between items-center">
-        <h3 class="text-xs uppercase text-on-surface-variant">API Keys (Stacks)</h3>
-        <button onclick="addProvKey()" class="text-sm text-primary hover:underline flex items-center gap-1"><span class="material-symbols-outlined text-base">add</span>Add Key</button>
+      <div class="border border-outline-variant rounded p-4 bg-surface-container-low flex flex-col gap-3">
+        <div class="flex justify-between items-center">
+          <h3 class="text-xs uppercase text-on-surface-variant">Deployment Links</h3>
+          <button onclick="addProvLink()" class="text-sm text-primary hover:underline flex items-center gap-1"><span class="material-symbols-outlined text-base">add</span>Add Link</button>
+        </div>
+        <p class="text-xs text-on-surface-variant">Each URL serves exactly one model. The router auto-discovers the model at each link.</p>
+        <table class="w-full"><thead><tr class="text-xs uppercase text-on-surface-variant"><th class="text-left pb-2">URL</th><th class="text-left pb-2">Key</th><th class="text-right pb-2">Actions</th></tr></thead><tbody id="prov-link-tbody">${linkRows}</tbody></table>
       </div>
-      <table class="w-full"><thead><tr class="text-xs uppercase text-on-surface-variant"><th class="text-left pb-2">Nickname</th><th class="text-left pb-2">Key Value</th><th class="text-right pb-2">Actions</th></tr></thead><tbody id="prov-key-tbody">${keyRows}</tbody></table>
-    </div>
       <div id="prov-conn-status" class="text-sm text-on-surface-variant min-h-6"></div>
-    <div class="border border-outline-variant rounded p-4 bg-surface-container-low flex flex-col gap-3">
-      <div class="flex justify-between items-center">
-        <h3 class="text-xs uppercase text-on-surface-variant">Models & Routing</h3>
-        <button id="prov-fetch-models" onclick="fetchModels()" class="text-sm text-primary hover:underline flex items-center gap-1"><span class="material-symbols-outlined text-base">refresh</span>Fetch Models</button>
+      <div class="border border-outline-variant rounded p-4 bg-surface-container-low flex flex-col gap-3">
+        <div class="flex justify-between items-center">
+          <h3 class="text-xs uppercase text-on-surface-variant">Models & Routing</h3>
+          <button id="prov-fetch-models" onclick="fetchModels()" class="text-sm text-primary hover:underline flex items-center gap-1"><span class="material-symbols-outlined text-base">refresh</span>Fetch Models</button>
+        </div>
+        <div id="prov-models-list" class="flex flex-col gap-2">
+          <p class="text-sm text-on-surface-variant">Loading models…</p>
+        </div>
+      </div>`;
+  } else {
+    // Single-endpoint provider: original layout
+    const keyCount = keys.length;
+    const keyRows = keys.length > 0 ? keys.map((k,i) => keyRowHTML(k, i)).join('')
+      : '<tr><td colspan="3" class="py-3 text-sm text-on-surface-variant">No keys configured.</td></tr>';
+    document.getElementById('prov-detail-body').innerHTML = `
+      <div class="border border-outline-variant rounded p-4 bg-surface-container-low flex flex-col gap-3">
+        <h3 class="text-xs uppercase text-on-surface-variant">General Configuration</h3>
+        <label class="text-sm flex flex-col gap-1">Provider Name<input value="${esc(name)}" class="border border-outline-variant bg-white rounded px-3 py-2 text-sm" readonly></label>
+        <label class="text-sm flex flex-col gap-1">Base URL<input id="prov-detail-url" value="${esc(p.base_url||'')}" class="border border-outline-variant bg-white rounded px-3 py-2 text-sm font-mono"></label>
+        <label class="text-sm flex flex-col gap-1">API Mode<span class="text-xs text-on-surface-variant">wire format the upstream speaks</span><select id="prov-detail-mode" class="border border-outline-variant bg-white rounded px-3 py-2 text-sm">
+          <option value="openai" ${(p.api_mode||'')==='openai'||(!p.api_mode)?'selected':''}>OpenAI-compatible</option>
+          <option value="anthropic" ${p.api_mode==='anthropic'?'selected':''}>Anthropic (/v1/messages)</option>
+          <option value="gemini" ${p.api_mode==='gemini'?'selected':''}>Gemini (generateContent)</option>
+        </select></label>
+        <label class="text-sm flex flex-col gap-1 ${p.account_id || (p.base_url||'').includes('{account_id}') ? '' : 'hidden'}" id="prov-account-id-label">Account ID<span class="text-xs text-on-surface-variant">Required for Cloudflare Workers AI — used to fill {account_id} in the base URL</span><input id="prov-detail-account-id" value="${esc(p.account_id||'')}" placeholder="e.g. abc123def456" class="border border-outline-variant bg-white rounded px-3 py-2 text-sm font-mono"></label>
+        <div class="flex items-center justify-between">
+          <span class="text-sm">Enabled</span>
+          <div id="prov-detail-toggle" class="toggle-sw ${p.enabled?'on':''}" onclick="toggleProvDetailEnabled()"></div>
+        </div>
+        ${isLocal ? '<p class="text-xs text-on-surface-variant">Local provider -- keys not required.</p>' : ''}
       </div>
-      <div id="prov-models-list" class="flex flex-col gap-2">
-        <p class="text-sm text-on-surface-variant">Loading models…</p>
+      <div class="border border-outline-variant rounded p-4 bg-surface-container-low flex flex-col gap-3">
+        <div class="flex justify-between items-center">
+          <h3 class="text-xs uppercase text-on-surface-variant">API Keys (Stacks)</h3>
+          <button onclick="addProvKey()" class="text-sm text-primary hover:underline flex items-center gap-1"><span class="material-symbols-outlined text-base">add</span>Add Key</button>
+        </div>
+        <table class="w-full"><thead><tr class="text-xs uppercase text-on-surface-variant"><th class="text-left pb-2">Nickname</th><th class="text-left pb-2">Key Value</th><th class="text-right pb-2">Actions</th></tr></thead><tbody id="prov-key-tbody">${keyRows}</tbody></table>
       </div>
-    </div>`;
+      <div id="prov-conn-status" class="text-sm text-on-surface-variant min-h-6"></div>
+      <div class="border border-outline-variant rounded p-4 bg-surface-container-low flex flex-col gap-3">
+        <div class="flex justify-between items-center">
+          <h3 class="text-xs uppercase text-on-surface-variant">Models & Routing</h3>
+          <button id="prov-fetch-models" onclick="fetchModels()" class="text-sm text-primary hover:underline flex items-center gap-1"><span class="material-symbols-outlined text-base">refresh</span>Fetch Models</button>
+        </div>
+        <div id="prov-models-list" class="flex flex-col gap-2">
+          <p class="text-sm text-on-surface-variant">Loading models…</p>
+        </div>
+      </div>`;
+  }
   document.getElementById('prov-detail-panel').classList.add('open');
   history.pushState({detail:'provider'}, '');
-  // load models from cache first — auto-fetch from upstream if no cache yet
   loadProvModels(name);
 }
 function closeProvDetail() { document.getElementById('prov-detail-panel').classList.remove('open'); currentProvDetail = null; }
@@ -1836,6 +1886,25 @@ function removeProvKey(i) {
   currentProvDetail.keys.splice(i, 1);
   renderKeyTable();
 }
+function addProvLink() {
+  const tbody = document.getElementById('prov-link-tbody');
+  if (!tbody) return;
+  const newRow = document.createElement('tr');
+  newRow.className = 'prov-link-row';
+  newRow.innerHTML = `
+    <td class="py-2 text-sm"><input class="prov-link-url border border-outline-variant bg-white rounded px-2 py-1 text-sm w-full font-mono" placeholder="https://deployment.modal.direct/v1"></td>
+    <td class="py-2 text-sm"><input type="password" class="prov-link-key border border-outline-variant bg-white rounded px-2 py-1 text-sm w-full font-mono" placeholder="API key (optional)"></td>
+    <td class="py-2 text-right"><button onclick="this.closest('tr').remove()" class="text-trend-red text-sm px-2 py-1 hover:underline">Remove</button></td>`;
+  tbody.appendChild(newRow);
+  newRow.querySelector('.prov-link-url').focus();
+}
+function linkRowHTML(dl, i) {
+  return `<tr class="prov-link-row">
+    <td class="py-2 text-sm"><input class="prov-link-url border border-outline-variant bg-white rounded px-2 py-1 text-sm w-full font-mono" value="${esc(dl.url||'')}" placeholder="https://deployment.modal.direct/v1"></td>
+    <td class="py-2 text-sm"><input type="password" class="prov-link-key border border-outline-variant bg-white rounded px-2 py-1 text-sm w-full font-mono" value="${esc(dl.key||'')}" placeholder="API key (optional)"></td>
+    <td class="py-2 text-right"><button onclick="this.closest('tr').remove()" class="text-trend-red text-sm px-2 py-1 hover:underline">Remove</button></td>
+  </tr>`;
+}
 // keyRowHTML renders one key row. The nickname is an input on every row, not
 // just newly added ones, so an existing key can be renamed; `data-key-index`
 // ties it back to currentProvDetail.keys so saveProvDetail can collect labels
@@ -1860,7 +1929,35 @@ function renderKeyTable() {
 }
 async function saveProvDetail() {
   if (!currentProvDetail) return;
-  const {name, baseUrl, keys, enabled} = currentProvDetail;
+  const {name, baseUrl, keys, enabled, hasLinks, deploymentLinks} = currentProvDetail;
+
+  if (hasLinks) {
+    // Deployment-links provider: collect link rows from DOM
+    const newModeEl = document.getElementById('prov-detail-mode');
+    const newMode = newModeEl ? newModeEl.value : '';
+    const links = [];
+    document.querySelectorAll('#prov-link-tbody .prov-link-row').forEach(row => {
+      const url = row.querySelector('.prov-link-url')?.value?.trim() || '';
+      const key = row.querySelector('.prov-link-key')?.value?.trim() || '';
+      if (url) links.push({url, key});
+    });
+    // update api_mode via base_url endpoint (reuse SetProvider with empty base_url just for mode)
+    if (newMode && newMode !== (currentProvDetail.apiMode||'')) {
+      await api('/api/config/providers', {method:'POST', body:JSON.stringify({name, base_url:'', api_mode:newMode})});
+      currentProvDetail.apiMode = newMode;
+    }
+    // update deployment links
+    const r = await api('/api/config/providers', {method:'POST', body:JSON.stringify({name, deployment_links:links})});
+    if (!r.ok) {
+      showProvToast('Failed: ' + (typeof r.data?.error === 'string' ? r.data.error : r.status), true);
+      return;
+    }
+    currentProvDetail.deploymentLinks = links;
+    showProvToast('Provider settings saved');
+    return;
+  }
+
+  // Single-endpoint provider: original logic
   const newUrl = document.getElementById('prov-detail-url').value.trim();
   const newAccountId = document.getElementById('prov-detail-account-id')?.value.trim() || '';
   const newModeEl = document.getElementById('prov-detail-mode');
@@ -2207,31 +2304,97 @@ async function deleteProvider(name) {
 }
 async function addProvider() {
   const nameEl = document.getElementById('new-prov-name');
-  const urlEl = document.getElementById('new-prov-url');
-  const keysEl = document.getElementById('new-prov-keys');
-  const modeEl = document.getElementById('new-prov-mode');
   const name = nameEl.value.trim();
-  const url = urlEl.value.trim();
-  const keys = keysEl.value.split('\n').map(k=>k.trim()).filter(Boolean);
-  const apiMode = modeEl ? modeEl.value : 'openai';
-  if (!name || !url) { showConfigToast('Need name and base_url.'); return; }
+  if (!name) { showConfigToast('Need a provider name.'); return; }
+
   const btn = document.querySelector('#page-add-provider button[onclick="addProvider()"]');
   const origText = btn.textContent;
   btn.disabled = true;
   btn.textContent = 'Adding...';
-  const r = await api('/api/config/providers', {method:'POST', body:JSON.stringify({name, base_url:url, keys, api_mode:apiMode})});
+
+  let body = {name};
+  if (newProvMode === 'links') {
+    const links = [];
+    const rows = document.querySelectorAll('#new-prov-links-list .prov-link-row');
+    rows.forEach(row => {
+      const url = row.querySelector('.prov-link-url')?.value?.trim() || '';
+      const key = row.querySelector('.prov-link-key')?.value?.trim() || '';
+      if (url) links.push({url, key});
+    });
+    if (links.length === 0) {
+      showConfigToast('Add at least one deployment link.');
+      btn.disabled = false;
+      btn.textContent = origText;
+      return;
+    }
+    body.deployment_links = links;
+  } else {
+    const urlEl = document.getElementById('new-prov-url');
+    const keysEl = document.getElementById('new-prov-keys');
+    const modeEl = document.getElementById('new-prov-mode');
+    const url = urlEl.value.trim();
+    const keys = keysEl.value.split('\n').map(k=>k.trim()).filter(Boolean);
+    const apiMode = modeEl ? modeEl.value : 'openai';
+    if (!url) { showConfigToast('Need a base_url.'); btn.disabled = false; btn.textContent = origText; return; }
+    body.base_url = url;
+    body.keys = keys;
+    body.api_mode = apiMode;
+  }
+
+  const r = await api('/api/config/providers', {method:'POST', body:JSON.stringify(body)});
   btn.disabled = false;
   btn.textContent = origText;
   if (r.ok) {
     nameEl.value = '';
-    urlEl.value = '';
-    keysEl.value = '';
-    if (modeEl) modeEl.value = 'openai';
+    if (newProvMode === 'single') {
+      document.getElementById('new-prov-url').value = '';
+      document.getElementById('new-prov-keys').value = '';
+      if (document.getElementById('new-prov-mode')) document.getElementById('new-prov-mode').value = 'openai';
+    } else {
+      document.getElementById('new-prov-links-list').innerHTML = '';
+    }
     await loadConfig();
     showPage('providers');
   } else {
     showConfigToast('Failed: ' + (typeof r.data?.error === 'string' ? r.data.error : (r.data?.error?.message || r.status)));
   }
+}
+
+// newProvMode tracks which Add Provider form is shown
+let newProvMode = 'single';
+function setNewProvMode(mode) {
+  newProvMode = mode;
+  const singleBtn = document.getElementById('new-prov-mode-single');
+  const linksBtn = document.getElementById('new-prov-mode-links');
+  const singleSec = document.getElementById('new-prov-single-section');
+  const linksSec = document.getElementById('new-prov-links-section');
+  if (mode === 'single') {
+    singleBtn.className = 'text-sm px-3 py-1 rounded bg-primary text-on-primary';
+    linksBtn.className = 'text-sm px-3 py-1 rounded border border-outline-variant hover:bg-surface-container';
+    singleSec.classList.remove('hidden');
+    linksSec.classList.add('hidden');
+  } else {
+    singleBtn.className = 'text-sm px-3 py-1 rounded border border-outline-variant hover:bg-surface-container';
+    linksBtn.className = 'text-sm px-3 py-1 rounded bg-primary text-on-primary';
+    singleSec.classList.add('hidden');
+    linksSec.classList.remove('hidden');
+    // ensure at least one link row exists
+    if (document.getElementById('new-prov-links-list').children.length === 0) addNewProvLink();
+  }
+}
+
+function addNewProvLink() {
+  const list = document.getElementById('new-prov-links-list');
+  const row = document.createElement('div');
+  row.className = 'prov-link-row flex flex-col gap-1 border border-outline-variant rounded p-2 bg-surface-container-lowest';
+  row.innerHTML = `
+    <div class="flex gap-2 items-center">
+      <input class="prov-link-url flex-1 border border-outline-variant bg-white rounded px-2 py-1 text-sm font-mono" placeholder="https://deployment.modal.direct/v1">
+      <button type="button" onclick="this.closest('.prov-link-row').remove()" class="text-trend-red text-sm px-2 py-1 hover:underline">Remove</button>
+    </div>
+    <input class="prov-link-key w-full border border-outline-variant bg-white rounded px-2 py-1 text-sm font-mono" placeholder="API key (optional)">
+  `;
+  list.appendChild(row);
 }
 
 // --- playground ---

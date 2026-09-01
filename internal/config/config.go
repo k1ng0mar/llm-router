@@ -2,6 +2,7 @@
 package config
 
 import (
+	"crypto/sha256"
 	"errors"
 	"fmt"
 	"io"
@@ -127,6 +128,10 @@ func (m MediaPolicy) Decide(hasImage, hasAudio, hasVideo bool) (gateImage, gateA
 // soft toggle — the provider's config (keys, base_url) is preserved.
 // ModelLimits optionally caps max_tokens per model id, applied as an
 // upper bound before the request is sent upstream.
+//
+// A provider is configured with EITHER a base_url (single-endpoint mode)
+// OR a list of deployment_links (multi-endpoint mode). The two are mutually
+// exclusive — Validate() rejects a provider that has both or neither.
 type Provider struct {
 	BaseURL     string         `yaml:"base_url"`
 	Keys        []string       `yaml:"keys"`
@@ -175,6 +180,56 @@ type Provider struct {
 	// handing an audio request to an image-only model. Absent entries defer
 	// entirely to the catalog.
 	MediaPolicies map[string]MediaPolicy `yaml:"media_policies"`
+	// DeploymentLinks is an independent list of deployment URLs for providers
+	// like Modal where each URL serves exactly one model. Each link carries
+	// its own API key. When set, BaseURL must be empty (mutually exclusive).
+	// All links pool together under one provider name; models are auto-discovered
+	// from each link's /v1/models endpoint.
+	DeploymentLinks []DeploymentLink `yaml:"deployment_links"`
+	// modelLinks maps a model id to the DeploymentLink that serves it.
+	// Populated at fetch time (not persisted) — the server fills this after
+	// discovering which model lives at which URL. Access only under c.mu.
+	modelLinks map[string]DeploymentLink `yaml:"-" json:"-"`
+}
+
+// DeploymentLink is one independent deployment URL within a provider.
+// Each URL serves exactly one model (auto-discovered via /v1/models) and
+// carries its own API key. Multiple DeploymentLinks pool together under
+// one provider name.
+type DeploymentLink struct {
+	URL string `yaml:"url" json:"url"`
+	Key string `yaml:"key" json:"key"`
+}
+
+// ShortHash returns a short hash of the URL for use in breaker keys
+// so that each deployment link gets its own circuit-breaker state.
+func (d DeploymentLink) ShortHash() string {
+	h := sha256.Sum256([]byte(d.URL))
+	return fmt.Sprintf("%x", h[:4])
+}
+
+// HasDeploymentLinks reports whether this provider uses deployment links
+// (multi-endpoint mode) instead of a single base_url.
+func (p *Provider) HasDeploymentLinks() bool {
+	return len(p.DeploymentLinks) > 0
+}
+
+// EffectiveBaseURL returns the base_url if set, otherwise the first
+// deployment link's URL. For backwards compatibility in places that
+// just need *a* URL from the provider.
+func (p *Provider) EffectiveBaseURL() string {
+	if p.BaseURL != "" {
+		return p.BaseURL
+	}
+	if len(p.DeploymentLinks) > 0 {
+		return p.DeploymentLinks[0].URL
+	}
+	return ""
+}
+
+// DeploymentLinkCount returns the number of deployment links configured.
+func (p *Provider) DeploymentLinkCount() int {
+	return len(p.DeploymentLinks)
 }
 
 // Providers groups provider kinds. A provider is addressed as its name:
@@ -370,6 +425,29 @@ func (c *Config) Validate() error {
 				return fmt.Errorf("provider %q model %q: %w", name, model, err)
 			}
 		}
+		// A provider must have EITHER base_url OR at least one deployment_link,
+		// but NOT both. Neither set means no upstream to call; both set is
+		// ambiguous (which does the router use?).
+		hasBase := p.BaseURL != ""
+		hasLinks := len(p.DeploymentLinks) > 0
+		if hasBase && hasLinks {
+			return fmt.Errorf("provider %q has both base_url and deployment_links — set one or the other", name)
+		}
+		if !hasBase && !hasLinks {
+			// Built-in/local providers (openrouter, ollama) may not have a base_url
+			// configured if the user removed it — but they should still be valid
+			// as placeholders. Skip validation for them.
+			if name == "openrouter" || name == "ollama" {
+				continue
+			}
+			return fmt.Errorf("provider %q has neither base_url nor deployment_links", name)
+		}
+		// validate each deployment link has a URL
+		for i, dl := range p.DeploymentLinks {
+			if dl.URL == "" {
+				return fmt.Errorf("provider %q deployment_links[%d] missing url", name, i)
+			}
+		}
 	}
 	switch c.Fallback.Strategy {
 	case "round_robin", "least_used":
@@ -441,6 +519,13 @@ func (c *Config) Redacted() map[string]any {
 		}
 		return k[:2] + "**" + k[len(k)-2:]
 	}
+	maskDL := func(links []DeploymentLink) []map[string]any {
+		out := make([]map[string]any, 0, len(links))
+		for _, dl := range links {
+			out = append(out, map[string]any{"url": dl.URL, "key": mask(dl.Key)})
+		}
+		return out
+	}
 	provs := map[string]any{}
 	if c.Providers.OpenRouter != nil {
 		provs["openrouter"] = map[string]any{"base_url": c.Providers.OpenRouter.BaseURL, "keys": maskList(c.Providers.OpenRouter.Keys, mask), "enabled": c.Providers.OpenRouter.IsEnabled(), "disabled_models": c.Providers.OpenRouter.DisabledModels, "strip_params": c.Providers.OpenRouter.StripParams, "key_labels": c.Providers.OpenRouter.KeyLabels, "model_limits": c.Providers.OpenRouter.ModelLimits, "media_policies": c.Providers.OpenRouter.MediaPolicies, "repair_reasoning_content": c.Providers.OpenRouter.RepairReasoningContent, "preset": true}
@@ -449,7 +534,11 @@ func (c *Config) Redacted() map[string]any {
 		provs["ollama"] = map[string]any{"base_url": c.Providers.Ollama.BaseURL, "keys": maskList(c.Providers.Ollama.Keys, mask), "enabled": c.Providers.Ollama.IsEnabled(), "disabled_models": c.Providers.Ollama.DisabledModels, "strip_params": c.Providers.Ollama.StripParams, "key_labels": c.Providers.Ollama.KeyLabels, "model_limits": c.Providers.Ollama.ModelLimits, "media_policies": c.Providers.Ollama.MediaPolicies, "repair_reasoning_content": c.Providers.Ollama.RepairReasoningContent, "preset": true}
 	}
 	for name, p := range c.Providers.Custom {
-		provs[name] = map[string]any{"base_url": p.BaseURL, "account_id": p.AccountID, "keys": maskList(p.Keys, mask), "enabled": p.IsEnabled(), "disabled_models": p.DisabledModels, "strip_params": p.StripParams, "key_labels": p.KeyLabels, "model_limits": p.ModelLimits, "media_policies": p.MediaPolicies, "repair_reasoning_content": p.RepairReasoningContent, "preset": p.Preset, "api_mode": p.APIMode}
+		entry := map[string]any{"base_url": p.BaseURL, "account_id": p.AccountID, "keys": maskList(p.Keys, mask), "enabled": p.IsEnabled(), "disabled_models": p.DisabledModels, "strip_params": p.StripParams, "key_labels": p.KeyLabels, "model_limits": p.ModelLimits, "media_policies": p.MediaPolicies, "repair_reasoning_content": p.RepairReasoningContent, "preset": p.Preset, "api_mode": p.APIMode}
+		if len(p.DeploymentLinks) > 0 {
+			entry["deployment_links"] = maskDL(p.DeploymentLinks)
+		}
+		provs[name] = entry
 	}
 	heuristics := map[string][]string{}
 	for pool, kws := range c.Classifier.Heuristics {
@@ -762,14 +851,15 @@ func (c *Config) tierSortedEntriesNoLock(pool string) []string {
 // and is substituted into base_url at request time via the "{account_id}"
 // placeholder; pass "" for providers that don't need substitution. apiMode
 // selects the upstream wire format ("", "openai", "anthropic", "gemini").
+//
+// A provider must have EITHER base_url OR deployment_links. If deployment_links
+// are provided (as a non-nil slice), base_url may be empty. If both are set
+// or neither is set, an error is returned.
 func (c *Config) SetProvider(name, baseURL, accountID string, keys []string, apiMode string) error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	if name == "" {
 		return fmt.Errorf("provider name cannot be empty")
-	}
-	if baseURL == "" {
-		return fmt.Errorf("provider %q base_url cannot be empty", name)
 	}
 	// built-in providers can't be edited this way
 	if name == "openrouter" || name == "ollama" {
@@ -780,6 +870,9 @@ func (c *Config) SetProvider(name, baseURL, accountID string, keys []string, api
 	}
 	existing, ok := c.Providers.Custom[name]
 	if !ok {
+		if baseURL == "" {
+			return fmt.Errorf("provider %q base_url cannot be empty for new providers (use deployment_links for multi-endpoint mode)", name)
+		}
 		c.Providers.Custom[name] = &Provider{BaseURL: baseURL, AccountID: accountID, Keys: keys, APIMode: apiMode}
 	} else {
 		existing.BaseURL = baseURL
@@ -789,6 +882,30 @@ func (c *Config) SetProvider(name, baseURL, accountID string, keys []string, api
 			existing.Keys = keys
 		}
 	}
+	c.autodetectProviderStatesLocked()
+	return c.persistNoLock()
+}
+
+// SetProviderDeploymentLinks replaces the deployment_links list on an existing
+// provider. It clears base_url (the two are mutually exclusive) and updates
+// the provider to multi-endpoint mode. Pass an empty slice to clear links
+// and revert to single-endpoint mode (base_url must then be set separately).
+func (c *Config) SetProviderDeploymentLinks(name string, links []DeploymentLink) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if name == "" {
+		return fmt.Errorf("provider name cannot be empty")
+	}
+	if name == "openrouter" || name == "ollama" {
+		return fmt.Errorf("cannot edit built-in provider %q via this API", name)
+	}
+	p, ok := c.Providers.Get(name)
+	if !ok {
+		return fmt.Errorf("provider %q does not exist", name)
+	}
+	p.DeploymentLinks = links
+	p.BaseURL = "" // mutual exclusivity
+	p.Keys = nil   // keys live on the links now
 	c.autodetectProviderStatesLocked()
 	return c.persistNoLock()
 }
@@ -924,7 +1041,7 @@ func (c *Config) autodetectProviderStatesLocked() {
 		if p == nil || p.Enabled != nil {
 			continue
 		}
-		hasKeys := len(p.Keys) > 0
+		hasKeys := len(p.Keys) > 0 || len(p.DeploymentLinks) > 0
 		isLocal := strings.Contains(p.BaseURL, "127.0.0.1") || strings.Contains(p.BaseURL, "localhost")
 		if hasKeys || isLocal {
 			enabled := true
@@ -1043,10 +1160,42 @@ type ProviderRouting struct {
 	MediaPolicy            MediaPolicy
 }
 
+// GetProviderDeploymentLink returns the deployment link that serves the given
+// model for a provider. If the provider has no deployment links, or the model
+// has not been discovered yet, it returns false.
+func (p *Provider) GetProviderDeploymentLink(model string) (DeploymentLink, bool) {
+	if p == nil || !p.HasDeploymentLinks() {
+		return DeploymentLink{}, false
+	}
+	if p.modelLinks != nil {
+		dl, ok := p.modelLinks[model]
+		return dl, ok
+	}
+	return DeploymentLink{}, false
+}
+
+// SetModelLink records that the given model is served by the given link.
+// Called by the server after fetching /v1/models from a deployment link.
+func (p *Provider) SetModelLink(model string, dl DeploymentLink) {
+	if p == nil {
+		return
+	}
+	if p.modelLinks == nil {
+		p.modelLinks = map[string]DeploymentLink{}
+	}
+	p.modelLinks[model] = dl
+}
+
 // GetProviderRouting returns the routing-relevant fields of a provider under a
 // single read lock, so the hot path never reads provider fields while an admin
 // write (key rotation, toggle, model limits, media policy) is in flight. The
 // returned Keys slice is used to (re)build the per-provider KeyPicker.
+//
+// For providers with deployment links, the BaseURL and Keys are resolved from
+// the link that serves the requested model (discovered at fetch time). If the
+// model hasn't been discovered yet, the first link's URL and key are returned
+// as a fallback so the request can still proceed (the breaker key will differ
+// per actual URL at trip time).
 func (c *Config) GetProviderRouting(name, model string) ProviderRouting {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
@@ -1054,6 +1203,35 @@ func (c *Config) GetProviderRouting(name, model string) ProviderRouting {
 	if !ok || p == nil {
 		return ProviderRouting{}
 	}
+
+	// For deployment-links providers, resolve the specific link for this model.
+	if p.HasDeploymentLinks() {
+		dl, found := p.GetProviderDeploymentLink(model)
+		if !found {
+			// Model not yet discovered — fall back to first link so the
+			// request can still go through. The breaker key computed later
+			// in route.go uses the actual base URL from this struct.
+			dl = p.DeploymentLinks[0]
+		}
+		pr := ProviderRouting{
+			OK:                     true,
+			BaseURL:                dl.URL,
+			Keys:                   []string{dl.Key},
+			Enabled:                p.IsEnabled(),
+			ModelDisabled:          p.IsModelDisabled(model),
+			AccountID:              p.AccountID,
+			APIMode:                p.APIMode,
+			StripParams:            p.StripParams,
+			RepairReasoningContent: p.RepairReasoningContent,
+			MediaPolicy:            p.MediaPolicyFor(model),
+		}
+		if lim, has := p.ModelLimits[model]; has {
+			pr.ModelLimit = lim
+			pr.HasLimit = true
+		}
+		return pr
+	}
+
 	pr := ProviderRouting{
 		OK:                     true,
 		BaseURL:                p.BaseURL,

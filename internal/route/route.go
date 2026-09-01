@@ -18,6 +18,7 @@ package route
 
 import (
 	"context"
+	"crypto/sha256"
 	"errors"
 	"fmt"
 	"io"
@@ -154,9 +155,9 @@ func (r *Router) Status() map[string]any {
 	}
 	r.bMu.Unlock()
 	return map[string]any{
-		"keysCooling":     cooling,
-		"keysDead":        dead,
-		"keyTotal":        total,
+		"keysCooling":      cooling,
+		"keysDead":         dead,
+		"keyTotal":         total,
 		"providersCooling": breakers,
 	}
 }
@@ -224,6 +225,20 @@ func (r *Router) evictColdNoLock() {
 			delete(r.breakers, k)
 		}
 	}
+}
+
+// breakerKeyName computes the circuit-breaker key for a candidate. For
+// single-endpoint providers this is just "provider:model". For deployment-links
+// providers (where each URL serves one model), the key incorporates a short
+// hash of the base URL so each link gets its own cooldown state — otherwise a
+// failure on one Modal deployment would cool every other deployment under the
+// same provider.
+func breakerKeyName(ref, baseURL string) string {
+	if baseURL == "" {
+		return ref
+	}
+	h := sha256.Sum256([]byte(baseURL))
+	return ref + "@" + fmt.Sprintf("%x", h[:4])
 }
 
 // clearBreaker puts ref back in rotation after it answers 200.
@@ -385,14 +400,30 @@ func (r *Router) RouteExcluding(ctx context.Context, pool string, payload map[st
 	// Fail open: if every candidate is cooling down, honor none of them. A pool
 	// in which everything tripped must still be tried, or one bad minute turns
 	// into a hard 503 for the length of the cooldown.
-	cooling := map[string]breakerState{}
+	//
+	// The breaker key incorporates the base URL hash so deployment-links
+	// providers get per-link cooldown (one dead Modal deployment doesn't cool
+	// the others). We resolve each entry's base URL up front.
+	type coolingEntry struct {
+		key   string
+		state breakerState
+	}
+	cooling := map[string]coolingEntry{}
 	for _, ref := range entries {
-		if st, isOpen := r.breakerFor(strings.TrimSpace(ref)); isOpen {
-			cooling[strings.TrimSpace(ref)] = st
+		trimmed := strings.TrimSpace(ref)
+		// Resolve base URL for this entry to compute the composite breaker key.
+		cName, cModel, _ := r.cfg.Resolve(trimmed)
+		var baseURL string
+		if cName != "" {
+			baseURL = r.cfg.GetProviderRouting(cName, cModel).BaseURL
+		}
+		bk := breakerKeyName(trimmed, baseURL)
+		if st, isOpen := r.breakerFor(bk); isOpen {
+			cooling[trimmed] = coolingEntry{key: bk, state: st}
 		}
 	}
 	if len(cooling) == len(entries) {
-		cooling = map[string]breakerState{}
+		cooling = map[string]coolingEntry{}
 	}
 
 	attemptTimeout := time.Duration(r.cfg.GetFallback().TimeoutS) * time.Second
@@ -414,15 +445,15 @@ candidateLoop:
 			return res, ErrExhausted
 		}
 		refKey := strings.TrimSpace(ref)
-		if st, isCooling := cooling[refKey]; isCooling {
+		if ce, isCooling := cooling[refKey]; isCooling {
 			cName, cModel, cErr := r.cfg.Resolve(ref)
 			if cErr != nil {
 				cName, cModel = ref, ""
 			}
 			att := ap(cName, cModel, "", "router")
-			left := st.until.Sub(r.now()).Round(time.Second)
-			if th := r.cfg.GetFallback().ProviderFailureThreshold; th > 0 && st.fails >= th {
-				att.Err = fmt.Sprintf("excluded: %d consecutive failures, locked out for another %s", st.fails, left)
+			left := ce.state.until.Sub(r.now()).Round(time.Second)
+			if th := r.cfg.GetFallback().ProviderFailureThreshold; th > 0 && ce.state.fails >= th {
+				att.Err = fmt.Sprintf("excluded: %d consecutive failures, locked out for another %s", ce.state.fails, left)
 			} else {
 				att.Err = fmt.Sprintf("excluded: cooling down after a recent failure, retryable in %s", left)
 			}
@@ -500,6 +531,9 @@ candidateLoop:
 		// parks a key (neither says anything about the key), so the loop has to
 		// know for itself when it has run out of keys to try.
 		tried := make(map[int]bool, len(keys))
+		// breakerKey is set inside the keyLoop for each attempt; we track
+		// the last one so tripBreaker can use it after the key rotation is done.
+		var lastBreakerKey string
 		// Set by any hard failure below. One trip is recorded for the candidate
 		// once its keys are exhausted, so a six-key provider that fails on all
 		// six counts as one failure in the streak, not six.
@@ -589,6 +623,9 @@ candidateLoop:
 			if pr.AccountID != "" && strings.Contains(upBaseURL, "{account_id}") {
 				upBaseURL = strings.ReplaceAll(upBaseURL, "{account_id}", pr.AccountID)
 			}
+			// Composite breaker key: ref + base URL hash. For deployment-links
+			// providers this gives each link its own cooldown state.
+			lastBreakerKey = breakerKeyName(refKey, upBaseURL)
 			resp, doErr := r.client.Do(ctx, &provider.Upstream{Name: pName, BaseURL: upBaseURL, Keys: keys, APIMode: pr.APIMode}, key, upstreamPayload)
 			att.LatencyMs = int(time.Since(start).Milliseconds())
 
@@ -621,7 +658,7 @@ candidateLoop:
 			case att.Status == 200:
 				picker.MarkSuccess(keyIdx)
 				// Success ends the streak outright, not just the current window.
-				r.clearBreaker(refKey)
+				r.clearBreaker(lastBreakerKey)
 				res.Status = att.Status
 				res.Resp = resp
 				return res, nil
@@ -657,7 +694,7 @@ candidateLoop:
 				}
 				if retried && att.Status == 200 {
 					picker.MarkSuccess(keyIdx)
-					r.clearBreaker(refKey)
+					r.clearBreaker(lastBreakerKey)
 					res.Status = att.Status
 					res.Resp = resp
 					return res, nil
@@ -681,7 +718,7 @@ candidateLoop:
 		// One trip per candidate per request, recorded after its keys are spent,
 		// so the failure streak counts requests rather than key rotations.
 		if candidateFailed {
-			r.tripBreaker(refKey)
+			r.tripBreaker(lastBreakerKey)
 		}
 	}
 

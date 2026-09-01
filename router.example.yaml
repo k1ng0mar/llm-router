@@ -82,11 +82,24 @@ providers:
       repair_reasoning_content: false
 
     # An OpenAI-compatible custom provider. Set api_mode: anthropic or
-    # api_mode: gemini to talk to those native APIs directly instead.
+    # api_mode: gemini to talk to those native APIs directly.
     my-custom:
       base_url: https://api.example.com/v1
       keys: []
       api_mode: openai
+
+    # Deployment-links provider (e.g. Modal) — each URL serves exactly one
+    # model. The router auto-discovers the model at each link via /v1/models
+    # and pools them all under one provider name. Use this when a provider
+    # doesn't expose one base URL for multiple models.
+    # my-modal:
+    #   preset: true
+    #   api_mode: openai
+    #   deployment_links:
+    #     - url: https://my-deployment.modal.direct/v1
+    #       key: wk-my-key-1
+    #     - url: https://another-deployment.modal.direct/v1
+    #       key: wk-my-key-2
 
       # Cap max_tokens per model — an upper bound applied before the request
       # goes upstream.

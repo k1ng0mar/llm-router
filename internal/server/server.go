@@ -1133,12 +1133,13 @@ func (s *Server) handleSetProvider(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var body struct {
-		Name      string   `json:"name"`
-		BaseURL   string   `json:"base_url"`
-		AccountID string   `json:"account_id"`
-		Keys      []string `json:"keys"`
-		APIMode   string   `json:"api_mode"`
-		Action    string   `json:"action"`
+		Name             string                    `json:"name"`
+		BaseURL          string                    `json:"base_url"`
+		AccountID        string                    `json:"account_id"`
+		Keys             []string                  `json:"keys"`
+		APIMode          string                    `json:"api_mode"`
+		Action           string                    `json:"action"`
+		DeploymentLinks  []config.DeploymentLink   `json:"deployment_links"`
 	}
 	if err := json.NewDecoder(io.LimitReader(r.Body, 1<<20)).Decode(&body); err != nil {
 		writeJSON(w, http.StatusBadRequest, map[string]any{"error": err.Error()})
@@ -1153,6 +1154,30 @@ func (s *Server) handleSetProvider(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusOK, map[string]any{"deleted": body.Name})
 		return
 	}
+
+	// If deployment_links are provided, use that path.
+	if len(body.DeploymentLinks) > 0 {
+		if err := s.cfg.SetProviderDeploymentLinks(body.Name, body.DeploymentLinks); err != nil {
+			writeJSON(w, http.StatusBadRequest, map[string]any{"error": err.Error()})
+			return
+		}
+		s.router.InvalidatePicker(body.Name)
+		p, _ := s.cfg.Providers.Get(body.Name)
+		writeJSON(w, http.StatusOK, map[string]any{
+			"name": body.Name,
+			"deployment_links": p.DeploymentLinks,
+			"link_count": len(p.DeploymentLinks),
+		})
+		// async: fetch and cache models from each link
+		if s.store != nil {
+			for i := range p.DeploymentLinks {
+				dl := p.DeploymentLinks[i]
+				go s.fetchAndCacheModels(body.Name, dl.URL, dl.Key)
+			}
+		}
+		return
+	}
+
 	if err := s.cfg.SetProvider(body.Name, body.BaseURL, body.AccountID, body.Keys, body.APIMode); err != nil {
 		writeJSON(w, http.StatusBadRequest, map[string]any{"error": err.Error()})
 		return
@@ -1163,8 +1188,19 @@ func (s *Server) handleSetProvider(w http.ResponseWriter, r *http.Request) {
 
 	// async: fetch and cache models from the upstream so the dashboard has
 	// them ready without the user manually clicking "Fetch Models"
-	if s.store != nil && p.BaseURL != "" {
-		go s.fetchAndCacheModels(body.Name, p)
+	if s.store != nil {
+		if p.HasDeploymentLinks() {
+			for i := range p.DeploymentLinks {
+				dl := p.DeploymentLinks[i]
+				go s.fetchAndCacheModels(body.Name, dl.URL, dl.Key)
+			}
+		} else if p.BaseURL != "" {
+			key := ""
+			if len(p.Keys) > 0 {
+				key = p.Keys[0]
+			}
+			go s.fetchAndCacheModels(body.Name, p.BaseURL, key)
+		}
 	}
 }
 
@@ -1231,8 +1267,19 @@ func (s *Server) handleSetKeys(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{"name": body.Name, "key_count": len(p.Keys), "key_labels": p.KeyLabels})
 
 	// async: fetch and cache models now that keys are set
-	if s.store != nil && p.BaseURL != "" {
-		go s.fetchAndCacheModels(body.Name, p)
+	if s.store != nil {
+		if p.HasDeploymentLinks() {
+			for i := range p.DeploymentLinks {
+				dl := p.DeploymentLinks[i]
+				go s.fetchAndCacheModels(body.Name, dl.URL, dl.Key)
+			}
+		} else if p.BaseURL != "" {
+			key := ""
+			if len(p.Keys) > 0 {
+				key = p.Keys[0]
+			}
+			go s.fetchAndCacheModels(body.Name, p.BaseURL, key)
+		}
 	}
 }
 
@@ -1372,14 +1419,41 @@ func (s *Server) handleLogo(w http.ResponseWriter, r *http.Request) {
 
 // resolveProviderURL builds the /v1/models URL and resolves the API key for a
 // provider strictly from the configured values. It deliberately ignores any
-// caller-supplied ?base_url=/?key= query params: allowing those would turn the
-// admin API into an SSRF proxy to arbitrary internal/metadata endpoints.
+// caller-supplied ?base_url=/?key=/?link_hash= query params: allowing those
+// would turn the admin API into an SSRF proxy to arbitrary internal/metadata
+// endpoints.
+//
+// For providers with deployment links, the caller may pass ?link_hash= to
+// select a specific link. If no hash is given, the first link is used.
 func (s *Server) resolveProviderURL(r *http.Request) (modelsURL, key string, errStatus int, err error) {
 	name := r.PathValue("name")
 	p, ok := s.cfg.GetProvider(name)
 	if !ok {
 		return "", "", http.StatusNotFound, fmt.Errorf("provider not found")
 	}
+
+	// Deployment-links provider: pick the right link.
+	if p.HasDeploymentLinks() {
+		linkHash := r.URL.Query().Get("link_hash")
+		var selected *config.DeploymentLink
+		for i := range p.DeploymentLinks {
+			dl := &p.DeploymentLinks[i]
+			if linkHash == "" || dl.ShortHash() == linkHash {
+				selected = dl
+				break
+			}
+		}
+		if selected == nil {
+			// linkHash didn't match any link — fall back to first
+			selected = &p.DeploymentLinks[0]
+		}
+		u := strings.TrimRight(selected.URL, "/")
+		if !strings.HasSuffix(u, "/v1") {
+			u += "/v1"
+		}
+		return u + "/models", selected.Key, 0, nil
+	}
+
 	baseURL := p.BaseURL
 	accountID := p.AccountID
 	key = ""
@@ -1405,12 +1479,59 @@ func (s *Server) resolveProviderURL(r *http.Request) (modelsURL, key string, err
 // After a successful fetch, the models are cached in the store so the
 // dashboard doesn't need to re-fetch every time the provider panel is opened.
 // It uses the provider's configured base_url and key only (no caller overrides).
+//
+// For providers with deployment links, it fetches /v1/models from EACH link
+// and aggregates the results — each link serves exactly one model.
 func (s *Server) handleProviderModels(w http.ResponseWriter, r *http.Request) {
 	if !s.authorized(r) {
 		writeJSON(w, http.StatusUnauthorized, map[string]any{"error": map[string]string{"message": "unauthorized"}})
 		return
 	}
 	name := r.PathValue("name")
+	p, ok := s.cfg.GetProvider(name)
+	if !ok {
+		writeJSON(w, http.StatusNotFound, map[string]any{"error": "provider not found"})
+		return
+	}
+
+	// For deployment-links providers, fetch from all links and aggregate.
+	if p.HasDeploymentLinks() {
+		allModels := []map[string]any{}
+		anySuccess := false
+		for i := range p.DeploymentLinks {
+			dl := &p.DeploymentLinks[i]
+			models, err := s.fetchModelsFromURL(dl.URL, dl.Key)
+			if err != nil {
+				log.Printf("handleProviderModels %s link %s: %v", name, dl.ShortHash(), err)
+				continue
+			}
+			for _, m := range models {
+				m["link_hash"] = dl.ShortHash()
+				allModels = append(allModels, m)
+			}
+			anySuccess = true
+		}
+		if !anySuccess {
+			// fall back to cache
+			if s.store != nil {
+				cached, cerr := s.store.GetProviderModels(name)
+				if cerr == nil && len(cached) > 0 {
+					models := make([]map[string]any, 0, len(cached))
+					for _, m := range cached {
+						models = append(models, map[string]any{"id": m.ModelID, "object": "model", "source": m.Source})
+					}
+					writeJSON(w, http.StatusOK, map[string]any{"data": models, "cached": true})
+					return
+				}
+			}
+			writeJSON(w, http.StatusBadGateway, map[string]any{"error": "all deployment links failed"})
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]any{"data": allModels})
+		return
+	}
+
+	// Single-endpoint provider — original behavior.
 	modelsURL, key, errStatus, err := s.resolveProviderURL(r)
 	if err != nil {
 		writeJSON(w, errStatus, map[string]any{"error": err.Error()})
@@ -1476,6 +1597,56 @@ func (s *Server) handleProviderModels(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(resp.StatusCode)
 	w.Write(bodyBytes)
+}
+
+// fetchModelsFromURL fetches /v1/models from a single URL and returns the
+// model list. Used for deployment-links providers where each URL serves
+// exactly one model.
+func (s *Server) fetchModelsFromURL(baseURL, key string) ([]map[string]any, error) {
+	base := strings.TrimSuffix(baseURL, "/")
+	if !strings.HasSuffix(base, "/v1") {
+		base += "/v1"
+	}
+	req, err := http.NewRequest("GET", base+"/models", nil)
+	if err != nil {
+		return nil, err
+	}
+	if key != "" {
+		req.Header.Set("Authorization", "Bearer "+key)
+	}
+	client := &http.Client{Timeout: 15 * time.Second}
+	resp, err := client.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != 200 {
+		return nil, fmt.Errorf("HTTP %d", resp.StatusCode)
+	}
+	bodyBytes, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+	var data struct {
+		Data []struct {
+			ID string `json:"id"`
+		} `json:"data"`
+		Models []struct {
+			ID string `json:"id"`
+		} `json:"models"`
+	}
+	if json.Unmarshal(bodyBytes, &data) != nil {
+		return nil, fmt.Errorf("invalid JSON from /models")
+	}
+	var out []map[string]any
+	for _, m := range data.Data {
+		if m.ID != "" {
+			out = append(out, map[string]any{"id": m.ID, "object": "model", "source": "fetched"})
+		}
+	}
+	for _, m := range data.Models {
+		if m.ID != "" {
+			out = append(out, map[string]any{"id": m.ID, "object": "model", "source": "fetched"})
+		}
+	}
+	return out, nil
 }
 
 // handleGetCachedModels returns the stored model cache for a provider without
@@ -1574,11 +1745,15 @@ func (s *Server) handleRemoveCustomModel(w http.ResponseWriter, r *http.Request)
 	writeJSON(w, http.StatusOK, map[string]any{"deleted": modelID, "provider": name})
 }
 
-// fetchAndCacheModels fetches /v1/models from the upstream and caches the
+// fetchAndCacheModels fetches /v1/models from one upstream URL and caches the
 // result in the store. Designed to run as a goroutine — errors are silently
 // ignored (the cache just won't be populated, and the user can manually fetch).
-func (s *Server) fetchAndCacheModels(name string, p *config.Provider) {
-	base := strings.TrimSuffix(p.BaseURL, "/")
+//
+// For providers with deployment links, the caller should iterate each link and
+// call this with the specific URL + key. Each discovered model is tagged with
+// the link's hash so per-link model→link mapping can be reconstructed.
+func (s *Server) fetchAndCacheModels(name string, baseURL string, key string) {
+	base := strings.TrimSuffix(baseURL, "/")
 	if !strings.HasSuffix(base, "/v1") {
 		base += "/v1"
 	}
@@ -1586,10 +1761,6 @@ func (s *Server) fetchAndCacheModels(name string, p *config.Provider) {
 	if err != nil {
 		log.Printf("fetchAndCacheModels %s: %v", name, err)
 		return
-	}
-	key := ""
-	if len(p.Keys) > 0 {
-		key = p.Keys[0]
 	}
 	if key != "" {
 		req.Header.Set("Authorization", "Bearer "+key)
