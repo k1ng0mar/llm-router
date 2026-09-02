@@ -7,7 +7,10 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
+	"net/netip"
+	neturl "net/url"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -17,6 +20,28 @@ import (
 
 	"gopkg.in/yaml.v3"
 )
+
+// isPrivateHost reports whether host refers to a private, loopback, link-local,
+// or otherwise non-public address. Used to block SSRF via user-controlled URLs.
+func isPrivateHost(host string) bool {
+	// Fast path for localhost names.
+	if host == "localhost" || host == "127.0.0.1" || host == "::1" {
+		return true
+	}
+	// Resolve and classify via netip.
+	addr, err := netip.ParseAddr(host)
+	if err != nil {
+		// If it resolves to any private range, treat as private.
+		addrs, _ := net.LookupHost(host)
+		for _, a := range addrs {
+			if pa, perr := netip.ParseAddr(a); perr == nil && (pa.IsLoopback() || pa.IsPrivate() || pa.IsLinkLocalUnicast() || pa.IsLinkLocalMulticast() || pa.IsUnspecified()) {
+				return true
+			}
+		}
+		return false
+	}
+	return addr.IsLoopback() || addr.IsPrivate() || addr.IsLinkLocalUnicast() || addr.IsLinkLocalMulticast() || addr.IsUnspecified()
+}
 
 const defaultCatalogURL = "https://models.dev/api.json"
 
@@ -911,6 +936,18 @@ func (c *Config) SetProvider(name, baseURL, accountID string, keys []string, api
 func discoverDeploymentModel(baseURL, key string) (string, error) {
 	client := &http.Client{Timeout: 15 * time.Second}
 	url := strings.TrimRight(baseURL, "/") + "/models"
+	// SSRF guard: reject private/internal addresses before issuing the request.
+	// An attacker with provider-CRUD access could otherwise point baseURL at
+	// 169.254.169.254 (cloud metadata) or 127.0.0.1:<internal-port>.
+	u, err := neturl.Parse(url)
+	if err != nil {
+		return "", fmt.Errorf("invalid baseURL: %w", err)
+	}
+	if host := u.Hostname(); host != "" {
+		if isPrivateHost(host) {
+			return "", fmt.Errorf("baseURL host %q is not allowed (private/internal)", host)
+		}
+	}
 	req, err := http.NewRequest("GET", url, nil)
 	if err != nil {
 		return "", err
