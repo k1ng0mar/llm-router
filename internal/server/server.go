@@ -105,6 +105,7 @@ func (s *Server) buildMux() http.Handler {
 	mux.HandleFunc("POST /api/config/default", s.handleSetDefault)
 	mux.HandleFunc("POST /api/config/pools", s.handleSetPool)
 	mux.HandleFunc("POST /api/config/providers", s.handleSetProvider)
+	mux.HandleFunc("POST /api/config/providers/{name}/deployments/{deploy}", s.handleSetProviderDeployment)
 	mux.HandleFunc("PUT /api/config/providers/{name}", s.handleUpdateProvider)
 	mux.HandleFunc("POST /api/config/keys", s.handleSetKeys)
 	mux.HandleFunc("POST /api/config/fallback", s.handleSetFallback)
@@ -360,6 +361,12 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 	}
 	hasImage, hasAudio, hasVideo := media.Image, media.Audio, media.Video
 	streaming, _ := payload["stream"].(bool)
+	// Raw mode: a request-level opt-out of the router's protective gates
+	// (breaker, capability gate, media policy, context floor). Playground
+	// diagnostics only — the dashboard playground is the only intended
+	// sender, and the flag is stripped below so it never reaches an upstream.
+	rawMode, _ := payload["raw"].(bool)
+	delete(payload, "raw")
 	// Vision chain. When an image lands in a pool whose models can't read
 	// pixels, an image-capable model describes it first and the original pool
 	// answers with that description folded into the question. Applies to any
@@ -401,6 +408,26 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 	start := time.Now()
 	minCtx := estimateTokens(payload)
 	res, err := s.router.Route(r.Context(), pool, payload, hasImage, hasAudio, hasVideo, minCtx)
+	if rawMode {
+		// Raw probe: retry through the gates once. The first Route call is kept
+		// so the trail still shows what production would have done; the raw
+		// pass then dials candidates the gate would have excluded. If the
+		// normal pass already succeeded, the raw pass never runs.
+		if err != nil {
+			resRaw, errRaw := s.router.RouteRaw(r.Context(), pool, payload, hasImage, hasAudio, hasVideo, minCtx)
+			if resRaw != nil {
+				for i := range resRaw.Attempts {
+					resRaw.Attempts[i].Seq += len(res.Attempts)
+				}
+				res.Attempts = append(res.Attempts, resRaw.Attempts...)
+				if errRaw == nil {
+					res.Status, res.Rule = resRaw.Status, resRaw.Rule
+					res.Resp = resRaw.Resp
+					err = nil
+				}
+			}
+		}
+	}
 
 	// Second chance for the direct-pixel path: every pixel-capable candidate
 	// failed, but the pool may hold text-only models the gate had to exclude.
@@ -1532,6 +1559,7 @@ func (s *Server) handleProviderModels(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Single-endpoint provider — original behavior.
+
 	modelsURL, key, errStatus, err := s.resolveProviderURL(r)
 	if err != nil {
 		writeJSON(w, errStatus, map[string]any{"error": err.Error()})
@@ -1846,4 +1874,42 @@ func (s *Server) handleProviderTest(w http.ResponseWriter, r *http.Request) {
 	json.NewDecoder(resp.Body).Decode(&data)
 	count := len(data.Data) + len(data.Models)
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "model_count": count})
+}
+
+// handleSetProviderDeployment adds/updates/deletes one deployment under a
+// multi-deployment provider (e.g. Modal). Parent provider must already exist.
+func (s *Server) handleSetProviderDeployment(w http.ResponseWriter, r *http.Request) {
+	if !s.authorized(r) {
+		writeJSON(w, http.StatusUnauthorized, map[string]any{"error": map[string]string{"message": "unauthorized"}})
+		return
+	}
+	parent := r.PathValue("name")
+	deploy := r.PathValue("deploy")
+	if parent == "" || deploy == "" {
+		writeJSON(w, http.StatusBadRequest, map[string]any{"error": "provider and deployment path params required"})
+		return
+	}
+	var body struct {
+		BaseURL string   `json:"base_url"`
+		Model   string   `json:"model"`
+		Keys    []string `json:"keys"`
+		Action  string   `json:"action"`
+	}
+	if err := json.NewDecoder(io.LimitReader(r.Body, 1<<20)).Decode(&body); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]any{"error": err.Error()})
+		return
+	}
+	if err := s.cfg.SetProviderDeployment(parent, deploy, body.BaseURL, body.Model, body.Keys, body.Action); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]any{"error": err.Error()})
+		return
+	}
+	// pickers are keyed by provider name; deployment refs resolve through the
+	// same path, so invalidate both the parent view and the full ref.
+	s.router.InvalidatePicker(parent + "/" + deploy)
+	s.router.InvalidatePicker(parent)
+	if body.Action == "delete" {
+		writeJSON(w, http.StatusOK, map[string]any{"deleted": parent + "/" + deploy})
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"deployment": parent + "/" + deploy, "base_url": body.BaseURL, "model": body.Model, "key_count": len(body.Keys)})
 }

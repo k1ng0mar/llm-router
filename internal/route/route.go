@@ -366,6 +366,15 @@ func (r *Router) Route(ctx context.Context, pool string, payload map[string]any,
 	return r.RouteExcluding(ctx, pool, payload, hasImage, hasAudio, hasVideo, minContext, nil)
 }
 
+// RouteRaw is Route with the protective gates disabled: circuit breaker,
+// capability gate, media policy, and context floor are all bypassed so a
+// probe reaches the exact candidate even if the router considers it dead,
+// exhausted, or too small. Intended for the dashboard playground's raw
+// mode — a one-off diagnostic dial — never for production traffic.
+func (r *Router) RouteRaw(ctx context.Context, pool string, payload map[string]any, hasImage, hasAudio, hasVideo bool, minContext int) (*Result, error) {
+	return r.RouteExcluding(ctx, pool, payload, hasImage, hasAudio, hasVideo, minContext, nil, true)
+}
+
 // RouteExcluding is Route with a set of "provider:model" refs to leave out of the
 // candidate list entirely. Skipped refs produce no attempt record, since a caller
 // only excludes what it has already tried and logged.
@@ -373,7 +382,13 @@ func (r *Router) Route(ctx context.Context, pool string, payload map[string]any,
 // The describe-hop retry uses this: the candidates whose pixel attempts just
 // failed are not worth re-treading as text, and doing so would add a full
 // per-attempt timeout per key to an error path that is already slow.
-func (r *Router) RouteExcluding(ctx context.Context, pool string, payload map[string]any, hasImage, hasAudio, hasVideo bool, minContext int, skip map[string]bool) (*Result, error) {
+//
+// raw disables the router's protective exclusions (circuit breaker, capability
+// gate, media policy, context floor) so every remaining candidate is dialed
+// even when the router believes it is dead, disabled, or too small. Playground
+// diagnostics only; production callers pass false.
+func (r *Router) RouteExcluding(ctx context.Context, pool string, payload map[string]any, hasImage, hasAudio, hasVideo bool, minContext int, skip map[string]bool, raw ...bool) (*Result, error) {
+	rawMode := len(raw) > 0 && raw[0]
 	res := &Result{Pool: pool}
 	entries := r.resolveEntries(pool, payload)
 	if len(skip) > 0 {
@@ -400,30 +415,32 @@ func (r *Router) RouteExcluding(ctx context.Context, pool string, payload map[st
 	// Fail open: if every candidate is cooling down, honor none of them. A pool
 	// in which everything tripped must still be tried, or one bad minute turns
 	// into a hard 503 for the length of the cooldown.
-	//
 	// The breaker key incorporates the base URL hash so deployment-links
 	// providers get per-link cooldown (one dead Modal deployment doesn't cool
-	// the others). We resolve each entry's base URL up front.
+	// the others). We resolve each entry's base URL up front. Raw mode skips
+	// the breaker entirely — it dials even cooling candidates.
 	type coolingEntry struct {
 		key   string
 		state breakerState
 	}
 	cooling := map[string]coolingEntry{}
-	for _, ref := range entries {
-		trimmed := strings.TrimSpace(ref)
-		// Resolve base URL for this entry to compute the composite breaker key.
-		cName, cModel, _ := r.cfg.Resolve(trimmed)
-		var baseURL string
-		if cName != "" {
-			baseURL = r.cfg.GetProviderRouting(cName, cModel).BaseURL
+	if !rawMode {
+		for _, ref := range entries {
+			trimmed := strings.TrimSpace(ref)
+			// Resolve base URL for this entry to compute the composite breaker key.
+			cName, cModel, _ := r.cfg.Resolve(trimmed)
+			var baseURL string
+			if cName != "" {
+				baseURL = r.cfg.GetProviderRouting(cName, cModel).BaseURL
+			}
+			bk := breakerKeyName(trimmed, baseURL)
+			if st, isOpen := r.breakerFor(bk); isOpen {
+				cooling[trimmed] = coolingEntry{key: bk, state: st}
+			}
 		}
-		bk := breakerKeyName(trimmed, baseURL)
-		if st, isOpen := r.breakerFor(bk); isOpen {
-			cooling[trimmed] = coolingEntry{key: bk, state: st}
+		if len(cooling) == len(entries) {
+			cooling = map[string]coolingEntry{}
 		}
-	}
-	if len(cooling) == len(entries) {
-		cooling = map[string]coolingEntry{}
 	}
 
 	attemptTimeout := time.Duration(r.cfg.GetFallback().TimeoutS) * time.Second
@@ -489,7 +506,7 @@ candidateLoop:
 		// so the catalog cannot veto a model the operator knows has native
 		// support. Modalities left on "auto" pass through untouched.
 		gateImage, gateAudio, gateVideo, denied := pr.MediaPolicy.Decide(hasImage, hasAudio, hasVideo)
-		if denied != "" {
+		if denied != "" && !rawMode {
 			att := ap(pName, model, "", "router")
 			att.Status = 0
 			att.Err = "excluded: " + denied
@@ -501,7 +518,7 @@ candidateLoop:
 		if toolsFromPayload(payload) {
 			needsTools = 1
 		}
-		if ok, reason := r.gate.Check(ref, gateImage, gateAudio, gateVideo, minContext, needsTools); !ok {
+		if ok, reason := r.gate.Check(ref, gateImage, gateAudio, gateVideo, minContext, needsTools); !ok && !rawMode {
 			att := ap(pName, model, "", "router")
 			att.Status = 0
 			att.Err = "excluded: " + reason
@@ -514,7 +531,7 @@ candidateLoop:
 		// This is what makes a 512k/1m advertised pool actually route only to
 		// models that can hold that much — the rest fall through to the next
 		// candidate. Unknown models (real ctx 0) are kept: they fail open.
-		if floor := r.poolContextFloor(pool); floor > 0 {
+		if floor := r.poolContextFloor(pool); floor > 0 && !rawMode {
 			if realCtx := r.gate.ContextWindow(ref); realCtx > 0 && realCtx < floor {
 				att := ap(pName, model, "", "router")
 				att.Status = 0
@@ -561,7 +578,14 @@ candidateLoop:
 				for k, v := range payload {
 					upstreamPayload[k] = v
 				}
-				upstreamPayload["model"] = model
+				// Deployment-as-model: pr.UpstreamModel carries the real
+				// upstream id when the pool-facing model slot named a
+				// deployment ("Modal:glm53" -> "glm-5.3-flash").
+				if pr.UpstreamModel != "" {
+					upstreamPayload["model"] = pr.UpstreamModel
+				} else {
+					upstreamPayload["model"] = model
+				}
 				payloadCopied = true
 			}
 			// apply per-model max_tokens cap if configured

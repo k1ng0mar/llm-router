@@ -228,6 +228,9 @@ table { border-collapse: collapse; }
       <label class="text-sm flex items-center gap-2">
         <span class="text-on-surface-variant whitespace-nowrap">Max tokens</span>
         <input id="pg-max-tokens" type="number" value="100" min="1" max="8192" class="border border-outline-variant bg-white rounded px-2 py-1.5 text-sm w-24">
+        <label class="flex items-center gap-1.5 text-xs text-on-surface-variant" title="Dial candidates the router would exclude (circuit breaker, capability gate, quota, context floor). Diagnostic use — first choice is still gated in production.">
+          <input id="pg-raw-mode" type="checkbox" class="accent-primary"> Raw mode
+        </label>
       </label>
       <div class="flex-1"></div>
       <button onclick="addPgRow()" class="border border-outline-variant bg-white text-sm px-3 py-2 rounded hover:bg-surface-container flex items-center gap-1">
@@ -1723,6 +1726,71 @@ function renderProviders() {
   if (!html) html = '<p class="text-sm text-on-surface-variant">No providers configured yet.</p>';
   el.innerHTML = html;
 }
+// --- provider deployments (Modal-style: one link + key per model) ---
+// Each deployment IS a model slot: the link serves exactly one upstream
+// model, auto-discovered from {link}/models when the dashboard adds it.
+function renderDeploymentsSection(provName, deps) {
+  const rows = Object.entries(deps).map(([dname, d]) => `
+    <tr>
+      <td class="py-2 text-sm font-medium">${esc(dname)}</td>
+      <td class="py-2 text-sm font-mono text-on-surface-variant" style="max-width:280px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="${esc(d.base_url||'')}">${esc(d.base_url||'')}</td>
+      <td class="py-2 text-sm font-mono">${esc(d.model||'—')}</td>
+      <td class="py-2 text-sm text-on-surface-variant">${(d.key_count||0)} key${(d.key_count||0)>1?'s':''}</td>
+      <td class="py-2 text-right"><button onclick="deleteDeployment('${esc(provName)}','${esc(dname)}')" class="text-trend-red text-sm hover:underline">Remove</button></td>
+    </tr>`).join('');
+  return `
+    <div class="border border-outline-variant rounded p-4 bg-surface-container-low flex flex-col gap-3">
+      <div class="flex justify-between items-center">
+        <h3 class="text-xs uppercase text-on-surface-variant">Deployments <span class="normal-case font-normal">(each link serves one model — model auto-discovered)</span></h3>
+      </div>
+      <table class="w-full"><thead><tr class="text-xs uppercase text-on-surface-variant">
+        <th class="text-left pb-2">Name</th><th class="text-left pb-2">Deployment Link</th><th class="text-left pb-2">Model (auto)</th><th class="text-left pb-2">Keys</th><th class="text-right pb-2">Actions</th>
+      </tr></thead><tbody>${rows}</tbody></table>
+      <p class="text-xs text-on-surface-variant">Addressable in pools as <span class="font-mono">${esc(provName)}/&lt;name&gt;</span>. Add a link + key below and the router discovers its model automatically.</p>
+    </div>`;
+}
+function renderAddDeploymentForm(provName) {
+  return `
+    <div class="border border-outline-variant rounded p-4 bg-surface-container-low flex flex-col gap-3">
+      <h3 class="text-xs uppercase text-on-surface-variant">Add Deployment</h3>
+      <div class="grid grid-cols-1 md:grid-cols-3 gap-2">
+        <input id="newdep-name" placeholder="name (e.g. glm53)" class="border border-outline-variant bg-white rounded px-3 py-2 text-sm font-mono">
+        <input id="newdep-url" placeholder="deployment link (https://…modal.direct/v1)" class="border border-outline-variant bg-white rounded px-3 py-2 text-sm font-mono md:col-span-2">
+      </div>
+      <div class="grid grid-cols-1 md:grid-cols-3 gap-2 items-end">
+        <input id="newdep-key" placeholder="key (wk-…)" class="border border-outline-variant bg-white rounded px-3 py-2 text-sm font-mono md:col-span-2" type="password">
+        <button id="newdep-btn" onclick="addDeployment('${esc(provName)}')" class="border border-outline-variant rounded px-3 py-2 text-sm hover:bg-surface-container-low">Add Deployment</button>
+      </div>
+      <div id="newdep-status" class="text-sm text-on-surface-variant min-h-6"></div>
+    </div>`;
+}
+async function addDeployment(provName) {
+  const btn = document.getElementById('newdep-btn');
+  const statusEl = document.getElementById('newdep-status');
+  const name = document.getElementById('newdep-name').value.trim();
+  const url = document.getElementById('newdep-url').value.trim();
+  const key = document.getElementById('newdep-key').value.trim();
+  if (!name || !url || !key) { statusEl.textContent = 'name, link and key are all required.'; return; }
+  btn.disabled = true; btn.textContent = 'Adding…'; statusEl.textContent = 'Discovering model on the deployment…';
+  const r = await api(`/api/config/providers/${encodeURIComponent(provName)}/deployments/${encodeURIComponent(name)}`, {
+    method: 'POST', body: JSON.stringify({base_url: url, keys: [key]})
+  });
+  btn.disabled = false; btn.textContent = 'Add Deployment';
+  if (r.ok) {
+    statusEl.innerHTML = `<span class="text-trend-green">Added — model discovered: ${esc(r.data?.model||'?')}</span>`;
+    await loadConfig(); openProvDetail(provName);
+  } else {
+    const err = r.data?.error; const msg = typeof err === 'string' ? err : (err?.message || 'HTTP ' + r.status);
+    statusEl.innerHTML = `<span class="text-trend-red">${esc(msg)}</span>`;
+  }
+}
+async function deleteDeployment(provName, depName) {
+  const r = await api(`/api/config/providers/${encodeURIComponent(provName)}/deployments/${encodeURIComponent(depName)}`, {
+    method: 'POST', body: JSON.stringify({action: 'delete'})
+  });
+  if (r.ok) { await loadConfig(); openProvDetail(provName); }
+  else alert('Delete failed: ' + (r.data?.error || r.status));
+}
 async function toggleProvider(name, enabled) { const r = await api('/api/config/toggle', {method:'POST', body:JSON.stringify({name, enabled})}); if(r.ok) await loadConfig(); }
 function openProvDetail(name) {
   const p = currentConfig.providers?.[name]; if (!p) return;
@@ -1798,7 +1866,13 @@ function openProvDetail(name) {
           <div id="prov-detail-toggle" class="toggle-sw ${p.enabled?'on':''}" onclick="toggleProvDetailEnabled()"></div>
         </div>
         ${isLocal ? '<p class="text-xs text-on-surface-variant">Local provider -- keys not required.</p>' : ''}
-      </div>
+        ${(p.deployments && Object.keys(p.deployments).length) ? renderDeploymentsSection(name, p.deployments) : ''}
+        ${(p.deployments || name === 'Modal') ? renderAddDeploymentForm(name) : ''}
+        <div class="border border-outline-variant rounded p-4 bg-surface-container-low flex flex-col gap-3">
+          <div class="flex justify-between items-center">
+            <h3 class="text-xs uppercase text-on-surface-variant">Models & Routing</h3>
+            <button id="prov-fetch-models" onclick="fetchModels()" class="text-sm text-primary hover:underline flex items-center gap-1"><span class="material-symbols-outlined text-base">refresh</span>Fetch Models</button>
+          </div>
       <div class="border border-outline-variant rounded p-4 bg-surface-container-low flex flex-col gap-3">
         <div class="flex justify-between items-center">
           <h3 class="text-xs uppercase text-on-surface-variant">API Keys (Stacks)</h3>
@@ -2491,22 +2565,24 @@ function pgGetCombos() {
   return combos;
 }
 
-function pgBuildCompletionBody(prompt, provider, model, maxTokens) {
-  return {
+function pgBuildCompletionBody(prompt, provider, model, maxTokens, raw) {
+  const body = {
     model: provider + ':' + model,
     messages: [{role: 'user', content: prompt}],
     max_tokens: maxTokens,
     stream: false,
   };
+  if (raw) body.raw = true; // server strips this before any upstream call
+  return body;
 }
 
-async function pgRunOne(prompt, provider, model, maxTokens, index) {
+async function pgRunOne(prompt, provider, model, maxTokens, index, raw) {
   const start = performance.now();
-  const result = {provider, model, index, content: '', status: 0, usage: null, latencyMs: 0, error: null};
+  const result = {provider, model, index, content: '', status: 0, usage: null, latencyMs: 0, error: null, raw: !!raw};
   try {
     const r = await api('/v1/chat/completions', {
       method: 'POST',
-      body: JSON.stringify(pgBuildCompletionBody(prompt, provider, model, maxTokens)),
+      body: JSON.stringify(pgBuildCompletionBody(prompt, provider, model, maxTokens, raw)),
     });
     result.latencyMs = Math.round(performance.now() - start);
     result.status = r.status;
@@ -2546,9 +2622,12 @@ function pgRenderLoading(combos) {
 
 function pgRenderCard(result) {
   const ok = result.status >= 200 && result.status < 300 && !result.error;
+  const rawBadge = result.raw
+    ? ` <span class="text-xs font-mono px-2 py-0.5 rounded bg-trend-amber/10 text-trend-amber border border-trend-amber" title="Raw mode: router gates (breaker/capability/quota/context floor) were bypassed for this probe.">RAW</span>`
+    : '';
   const statusBadge = ok
-    ? `<span class="text-xs font-mono px-2 py-0.5 rounded bg-success-container text-success">SUCCESS</span>`
-    : `<span class="text-xs font-mono px-2 py-0.5 rounded bg-error-container text-error">ERROR</span>`;
+    ? `<span class="text-xs font-mono px-2 py-0.5 rounded bg-success-container text-success">SUCCESS</span>${rawBadge}`
+    : `<span class="text-xs font-mono px-2 py-0.5 rounded bg-error-container text-error">ERROR</span>${rawBadge}`;
   const body = result.error
     ? `<div class="text-sm text-error font-mono break-words whitespace-pre-wrap">${esc(String(result.error))}</div>`
     : `<div class="text-sm whitespace-pre-wrap break-words">${result.content ? esc(result.content) : '<span class="text-on-surface-variant">-- empty response --</span>'}</div>`;
@@ -2579,12 +2658,13 @@ async function runPlayground() {
   const combos = pgGetCombos();
   if (!combos.length) { showConfigToast('Add at least one provider+model pair.'); return; }
   const maxTokens = parseInt(document.getElementById('pg-max-tokens').value, 10) || 100;
+  const raw = document.getElementById('pg-raw-mode')?.checked || false;
   pgRunning = true;
   const runBtn = document.getElementById('pg-run-btn');
   runBtn.disabled = true;
   runBtn.innerHTML = '<span class="material-symbols-outlined text-base animate-spin">progress_activity</span>Running';
   pgRenderLoading(combos);
-  const results = await Promise.all(combos.map((c, i) => pgRunOne(prompt, c.provider, c.model, maxTokens, i)));
+  const results = await Promise.all(combos.map((c, i) => pgRunOne(prompt, c.provider, c.model, maxTokens, i, raw)));
   const res = document.getElementById('pg-results');
   res.innerHTML = results.map(r => pgRenderCard(r)).join('');
   pgResultsEmpty();
