@@ -1,26 +1,15 @@
-# Runtime state — never commit these
-router.yaml
-.router_key
-router.db
-router.db-shm
-router.db-wal
-file:router.db?mode=ro
-
-# Build artifacts
-llm-router
-*.exe
-*.test
-*.out
-
-# Logs
+# runtime state (never commit)
+*.db
+*.db-shm
+*.db-wal
 *.log
-logs/
-
-# Local dev
 .env
-.DS_Store
+*.bak*
+llm-router      # built binary
+quota.json      # runtime quota state
+router.yaml     # real config with secrets
+router_8016.yaml
 
-# OAuth bridge helpers + runtime state
-quota.json
-router.yaml.bak
-.db-backup/
+# local-only
+.vscode/
+.idea/
