@@ -3,14 +3,17 @@ package config
 
 import (
 	"crypto/sha256"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
+	"net/http"
 	"os"
 	"path/filepath"
 	"strconv"
 	"strings"
 	"sync"
+	"time"
 
 	"gopkg.in/yaml.v3"
 )
@@ -180,6 +183,12 @@ type Provider struct {
 	// handing an audio request to an image-only model. Absent entries defer
 	// entirely to the catalog.
 	MediaPolicies map[string]MediaPolicy `yaml:"media_policies"`
+	// Deployments holds per-deployment endpoints for multi-tenant providers
+	// (e.g. Modal: every deployment is its own hostname + key pair). Each
+	// deployment is addressable in pool refs as "<provider>/<deployment>:<model>"
+	// and resolves to its own base_url + keys. The parent provider's own
+	// BaseURL/Keys are untouched and can serve as a default.
+	Deployments map[string]*Deployment `yaml:"deployments,omitempty"`
 	// DeploymentLinks is an independent list of deployment URLs for providers
 	// like Modal where each URL serves exactly one model. Each link carries
 	// its own API key. When set, BaseURL must be empty (mutually exclusive).
@@ -190,6 +199,19 @@ type Provider struct {
 	// Populated at fetch time (not persisted) — the server fills this after
 	// discovering which model lives at which URL. Access only under c.mu.
 	modelLinks map[string]DeploymentLink `yaml:"-" json:"-"`
+}
+
+// Deployment is one named endpoint under a multi-deployment provider. Each
+// deployment serves exactly one model: Model is the upstream model id sent
+// in requests to BaseURL. In pool refs the deployment NAME is the model slot
+// ("Modal:glm53"); the router rewrites it to Model at the upstream boundary.
+type Deployment struct {
+	BaseURL string   `yaml:"base_url"`
+	Keys    []string `yaml:"keys"`
+	// Model is the upstream model id this deployment serves. Required — a
+	// deployment without one would silently send a garbage model name.
+	Model string `yaml:"model"`
+	Enabled *bool `yaml:"enabled,omitempty"` // nil = enabled (default)
 }
 
 // DeploymentLink is one independent deployment URL within a provider.
@@ -886,7 +908,121 @@ func (c *Config) SetProvider(name, baseURL, accountID string, keys []string, api
 	return c.persistNoLock()
 }
 
-// SetProviderDeploymentLinks replaces the deployment_links list on an existing
+func discoverDeploymentModel(baseURL, key string) (string, error) {
+	client := &http.Client{Timeout: 15 * time.Second}
+	url := strings.TrimRight(baseURL, "/") + "/models"
+	req, err := http.NewRequest("GET", url, nil)
+	if err != nil {
+		return "", err
+	}
+	if key != "" {
+		req.Header.Set("Authorization", "Bearer "+key)
+	}
+	resp, err := client.Do(req)
+	if err != nil {
+		return "", err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return "", fmt.Errorf("model discovery returned HTTP %d", resp.StatusCode)
+	}
+	body, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+	if err != nil {
+		return "", err
+	}
+	var parsed struct {
+		Data []struct {
+			ID string `json:"id"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal(body, &parsed); err != nil {
+		return "", err
+	}
+	if len(parsed.Data) == 0 {
+		return "", errors.New("deployment reports no models")
+	}
+	if len(parsed.Data) > 1 {
+		return "", fmt.Errorf("deployment reports %d models; a deployment link serves exactly one", len(parsed.Data))
+	}
+	return parsed.Data[0].ID, nil
+}
+
+// SetProviderDeployment adds, updates, or deletes one named deployment under a
+// multi-deployment provider (e.g. Modal). Parent provider must already exist.
+func (c *Config) SetProviderDeployment(parent, deploy, baseURL, model string, keys []string, action string) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if parent == "" || deploy == "" {
+		return fmt.Errorf("provider and deployment names cannot be empty")
+	}
+	if parent == "openrouter" || parent == "ollama" {
+		return fmt.Errorf("built-in provider %q does not support deployments", parent)
+	}
+	if strings.Contains(parent, "/") || strings.Contains(deploy, "/") {
+		return fmt.Errorf("deployment names cannot contain '/'")
+	}
+	pr, ok := c.Providers.Custom[parent]
+	if !ok || pr == nil {
+		return fmt.Errorf("provider %q does not exist — create it first", parent)
+	}
+	if pr.Deployments == nil {
+		pr.Deployments = map[string]*Deployment{}
+	}
+	if action == "delete" {
+		// refuse if any pool/vision entry references parent/child
+		full := parent + "/" + deploy
+		for pool, entries := range c.Pools {
+			for _, ref := range entries {
+				if prov, _, _ := strings.Cut(ref, ":"); prov == full {
+					return fmt.Errorf("cannot delete deployment %q: pool %q references it", full, pool)
+				}
+			}
+		}
+		for _, ref := range c.Vision {
+			if prov, _, _ := strings.Cut(ref, ":"); prov == full {
+				return fmt.Errorf("cannot delete deployment %q: vision list references it", full)
+			}
+		}
+		if _, ok := pr.Deployments[deploy]; !ok {
+			return fmt.Errorf("deployment %q does not exist on %q", deploy, parent)
+		}
+		delete(pr.Deployments, deploy)
+		return c.persistNoLock()
+	}
+	if baseURL == "" {
+		return fmt.Errorf("deployment %q base_url cannot be empty", deploy)
+	}
+	if keys == nil {
+		keys = []string{}
+	}
+	if model == "" {
+		// auto-discover: query the deployment's /models and use the single
+		// reported model ID. The caller passes keys (masked lists may carry
+		// real keys on create); try each until one authenticates.
+		var lastErr error
+		for _, k := range keys {
+			if k == "" {
+				continue
+			}
+			m, err := discoverDeploymentModel(baseURL, k)
+			if err == nil {
+				model = m
+				break
+			}
+			lastErr = err
+		}
+		if model == "" {
+			if lastErr != nil {
+				return fmt.Errorf("deployment %q: model discovery failed: %v (pass model explicitly to override)", deploy, lastErr)
+			}
+			return fmt.Errorf("deployment %q: no usable key for model discovery — pass key and model explicitly", deploy)
+		}
+	}
+	pr.Deployments[deploy] = &Deployment{BaseURL: baseURL, Keys: keys, Model: model}
+	return c.persistNoLock()
+}
+
+// SetProviderDeploymentLinks replaces the deployment links on an existing
 // provider. It clears base_url (the two are mutually exclusive) and updates
 // the provider to multi-endpoint mode. Pass an empty slice to clear links
 // and revert to single-endpoint mode (base_url must then be set separately).
@@ -1158,6 +1294,10 @@ type ProviderRouting struct {
 	StripParams            []string
 	RepairReasoningContent bool
 	MediaPolicy            MediaPolicy
+	// UpstreamModel is the real upstream model id when the pool-facing model
+	// slot names a deployment ("Modal:glm53" -> "glm-5.3-flash"). Empty when
+	// the provider has no deployment-based model mapping.
+	UpstreamModel string
 }
 
 // GetProviderDeploymentLink returns the deployment link that serves the given
