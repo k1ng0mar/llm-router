@@ -320,7 +320,11 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 	// the request detail view in the dashboard. Media parts are redacted so we
 	// don't persist megabytes of base64 in the event log.
 	redacted := redactPayloadForLog(payload)
-	reqBodyJSON, _ := json.Marshal(redacted)
+	reqBodyJSON, err := json.Marshal(redacted)
+	if err != nil {
+		log.Printf("handleChat: marshal redacted payload: %v", err)
+		reqBodyJSON = []byte("{}")
+	}
 	if len(reqBodyJSON) > maxStoredBody {
 		reqBodyJSON = reqBodyJSON[:maxStoredBody]
 	}
@@ -561,7 +565,7 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("X-Router-Pool", pool)
 	w.Header().Set("X-Router-Rule", rule)
 	w.WriteHeader(http.StatusOK)
-	flusher, _ := w.(http.Flusher)
+	flusher := w.(http.Flusher)
 
 	if streaming {
 		// SSE passthrough: forward each chunk in real time while capturing
