@@ -952,6 +952,7 @@ func discoverDeploymentModel(baseURL, key string) (string, error) {
 	if err != nil {
 		return "", err
 	}
+	req.Header.Set("User-Agent", "llm-router/1.0 (Mozilla/5.0 compatible)")
 	if key != "" {
 		req.Header.Set("Authorization", "Bearer "+key)
 	}
