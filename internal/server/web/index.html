@@ -228,6 +228,8 @@ table { border-collapse: collapse; }
       <label class="text-sm flex items-center gap-2">
         <span class="text-on-surface-variant whitespace-nowrap">Max tokens</span>
         <input id="pg-max-tokens" type="number" value="100" min="1" max="8192" class="border border-outline-variant bg-white rounded px-2 py-1.5 text-sm w-24">
+        <span class="text-on-surface-variant whitespace-nowrap ml-3">Context floor</span>
+        <input id="pg-ctx-floor" type="number" value="0" min="0" step="1000" class="border border-outline-variant bg-white rounded px-2 py-1.5 text-sm w-28" title="Minimum candidate context window in tokens for this probe. 0 = no floor, so a small-context model is not excluded by the pool's advertised ceiling. Only affects the playground request; production pools keep their pool_context floor.">
         <label class="flex items-center gap-1.5 text-xs text-on-surface-variant" title="Dial candidates the router would exclude (circuit breaker, capability gate, quota, context floor). Diagnostic use — first choice is still gated in production.">
           <input id="pg-raw-mode" type="checkbox" class="accent-primary"> Raw mode
         </label>
@@ -2565,7 +2567,7 @@ function pgGetCombos() {
   return combos;
 }
 
-function pgBuildCompletionBody(prompt, provider, model, maxTokens, raw) {
+function pgBuildCompletionBody(prompt, provider, model, maxTokens, raw, ctxFloor) {
   const body = {
     model: provider + ':' + model,
     messages: [{role: 'user', content: prompt}],
@@ -2573,16 +2575,17 @@ function pgBuildCompletionBody(prompt, provider, model, maxTokens, raw) {
     stream: false,
   };
   if (raw) body.raw = true; // server strips this before any upstream call
+  if (ctxFloor > 0) body.context_floor = ctxFloor;
   return body;
 }
 
-async function pgRunOne(prompt, provider, model, maxTokens, index, raw) {
+async function pgRunOne(prompt, provider, model, maxTokens, index, raw, ctxFloor) {
   const start = performance.now();
   const result = {provider, model, index, content: '', status: 0, usage: null, latencyMs: 0, error: null, raw: !!raw};
   try {
     const r = await api('/v1/chat/completions', {
       method: 'POST',
-      body: JSON.stringify(pgBuildCompletionBody(prompt, provider, model, maxTokens, raw)),
+      body: JSON.stringify(pgBuildCompletionBody(prompt, provider, model, maxTokens, raw, ctxFloor)),
     });
     result.latencyMs = Math.round(performance.now() - start);
     result.status = r.status;
@@ -2659,12 +2662,14 @@ async function runPlayground() {
   if (!combos.length) { showConfigToast('Add at least one provider+model pair.'); return; }
   const maxTokens = parseInt(document.getElementById('pg-max-tokens').value, 10) || 100;
   const raw = document.getElementById('pg-raw-mode')?.checked || false;
+  const ctxFloor = document.getElementById('pg-ctx-floor')?.value || '';
+  const ctxFloorN = (ctxFloor !== '' && !isNaN(parseInt(ctxFloor, 10)) && parseInt(ctxFloor, 10) >= 0) ? parseInt(ctxFloor, 10) : 0;
   pgRunning = true;
   const runBtn = document.getElementById('pg-run-btn');
   runBtn.disabled = true;
   runBtn.innerHTML = '<span class="material-symbols-outlined text-base animate-spin">progress_activity</span>Running';
   pgRenderLoading(combos);
-  const results = await Promise.all(combos.map((c, i) => pgRunOne(prompt, c.provider, c.model, maxTokens, i, raw)));
+  const results = await Promise.all(combos.map((c, i) => pgRunOne(prompt, c.provider, c.model, maxTokens, i, raw, ctxFloorN)));
   const res = document.getElementById('pg-results');
   res.innerHTML = results.map(r => pgRenderCard(r)).join('');
   pgResultsEmpty();

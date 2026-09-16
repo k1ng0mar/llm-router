@@ -389,6 +389,23 @@ func (r *Router) RouteRaw(ctx context.Context, pool string, payload map[string]a
 // diagnostics only; production callers pass false.
 func (r *Router) RouteExcluding(ctx context.Context, pool string, payload map[string]any, hasImage, hasAudio, hasVideo bool, minContext int, skip map[string]bool, raw ...bool) (*Result, error) {
 	rawMode := len(raw) > 0 && raw[0]
+	// Playground context-floor control: a request-level override of the pool's
+	// context floor (context_floor in the chat payload). -1/absent keeps the
+	// pool default; 0 disables the floor for this request, so probing a
+	// small-context model stops depending on which pool the classifier picked.
+	// JSON decodes numbers as float64; the field is stripped from the copy
+	// sent upstream below, like the model rewrite.
+	ctxFloor := -1
+	switch v := payload["context_floor"].(type) {
+	case float64:
+		if v >= 0 {
+			ctxFloor = int(v)
+		}
+	case int:
+		if v >= 0 {
+			ctxFloor = v
+		}
+	}
 	res := &Result{Pool: pool}
 	entries := r.resolveEntries(pool, payload)
 	if len(skip) > 0 {
@@ -531,7 +548,11 @@ candidateLoop:
 		// This is what makes a 512k/1m advertised pool actually route only to
 		// models that can hold that much — the rest fall through to the next
 		// candidate. Unknown models (real ctx 0) are kept: they fail open.
-		if floor := r.poolContextFloor(pool); floor > 0 && !rawMode {
+		floor := r.poolContextFloor(pool)
+		if ctxFloor >= 0 {
+			floor = ctxFloor
+		}
+		if floor > 0 && !rawMode {
 			if realCtx := r.gate.ContextWindow(ref); realCtx > 0 && realCtx < floor {
 				att := ap(pName, model, "", "router")
 				att.Status = 0
@@ -619,6 +640,18 @@ candidateLoop:
 				for _, sp := range pr.StripParams {
 					delete(upstreamPayload, sp)
 				}
+			}
+			// context_floor is a router-side playground control, never an
+			// upstream parameter.
+			if _, has := upstreamPayload["context_floor"]; has {
+				if !payloadCopied {
+					upstreamPayload = make(map[string]any, len(payload))
+					for k, v := range payload {
+						upstreamPayload[k] = v
+					}
+					payloadCopied = true
+				}
+				delete(upstreamPayload, "context_floor")
 			}
 			// Some DeepSeek-family gateways reject an assistant tool-call turn
 			// that arrives without reasoning_content. Put a placeholder back so
