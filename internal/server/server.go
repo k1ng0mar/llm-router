@@ -1574,6 +1574,7 @@ func (s *Server) handleProviderModels(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusBadGateway, map[string]any{"error": "invalid base_url: " + err.Error()})
 		return
 	}
+	req.Header.Set("User-Agent", "llm-router/1.0 (Mozilla/5.0 compatible)")
 	if key != "" {
 		req.Header.Set("Authorization", "Bearer "+key)
 	}
@@ -1643,6 +1644,7 @@ func (s *Server) fetchModelsFromURL(baseURL, key string) ([]map[string]any, erro
 	if err != nil {
 		return nil, err
 	}
+	req.Header.Set("User-Agent", "llm-router/1.0 (Mozilla/5.0 compatible)")
 	if key != "" {
 		req.Header.Set("Authorization", "Bearer "+key)
 	}
