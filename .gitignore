@@ -5,9 +5,12 @@
 *.log
 .env
 *.bak*
-llm-router      # built binary
-quota.json      # runtime quota state
-router.yaml     # real config with secrets
+# built binary
+llm-router
+# runtime quota state
+quota.json
+# real config with secrets
+router.yaml
 router_8016.yaml
 
 # local-only

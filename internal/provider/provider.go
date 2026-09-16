@@ -78,6 +78,7 @@ func (c *Client) doOpenAI(ctx context.Context, up *Upstream, key string, payload
 		return nil, err
 	}
 	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("User-Agent", "llm-router/1.0 (Mozilla/5.0 compatible)")
 	if key != "" {
 		req.Header.Set("Authorization", "Bearer "+key)
 	}
@@ -106,6 +107,7 @@ func (c *Client) doNative(ctx context.Context, up *Upstream, key string, payload
 		return nil, err
 	}
 	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("User-Agent", "llm-router/1.0 (Mozilla/5.0 compatible)")
 	switch mode {
 	case ModeAnthropic:
 		req.Header.Set("x-api-key", key)
