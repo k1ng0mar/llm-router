@@ -11,6 +11,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"syscall"
 	"time"
 
@@ -21,6 +22,7 @@ import (
 	"llm-router/internal/server"
 	"llm-router/internal/store"
 
+	"github.com/fsnotify/fsnotify"
 	"gopkg.in/yaml.v3"
 )
 
@@ -80,6 +82,52 @@ func loadCfg(args []string) *config.Config {
 	return cfg
 }
 
+// configWatcher watches the directory containing router.yaml via fsnotify and
+// reloads config in place on write/rename events. Editors that do atomic writes
+// (write temp + rename over the target) emit CREATE+RENAME+CHMOD, so watching
+// the directory is more reliable than watching the file itself. SIGHUP still
+// works as a manual fallback.
+func configWatcher(cfg *config.Config, r *route.Router) {
+	if cfg.Path == "" {
+		return
+	}
+	dir := filepath.Dir(cfg.Path)
+	target := filepath.Base(cfg.Path)
+	w, err := fsnotify.NewWatcher()
+	if err != nil {
+		log.Printf("router: config watcher init failed: %v", err)
+		return
+	}
+	go func() {
+		defer w.Close()
+		for {
+			select {
+			case ev, ok := <-w.Events:
+				if !ok {
+					return
+				}
+				if filepath.Base(ev.Name) != target {
+					continue
+				}
+				if err := cfg.ReloadFile(cfg.Path); err != nil {
+					log.Printf("router: config auto-reload failed: %v", err)
+					continue
+				}
+				r.InvalidateAllPickers()
+				log.Printf("router: config auto-reloaded from %s", cfg.Path)
+			case err, ok := <-w.Errors:
+				if !ok {
+					return
+				}
+				log.Printf("router: config watcher error: %v", err)
+			}
+		}
+	}()
+	if err := w.Add(dir); err != nil {
+		log.Printf("router: config watcher add failed for %s: %v", dir, err)
+	}
+}
+
 func serve(args []string) {
 	cfg := loadCfg(args)
 
@@ -91,8 +139,6 @@ func serve(args []string) {
 		}
 	}
 
-	// Quota-aware pool ordering: point the route package at the quota file, if
-	// one is configured. Empty quota_file disables it entirely (no disk access).
 	route.SetQuotaFile(cfg.QuotaFile)
 	if cfg.QuotaFile != "" {
 		log.Printf("quota-aware routing enabled (quota_file: %s)", cfg.QuotaFile)
@@ -105,22 +151,9 @@ func serve(args []string) {
 	defer st.Close()
 
 	gate := catalog.NewGate(catalog.DefaultSeed())
-	// The one deadline the router imposes: fallback.timeout_s bounds the wait
-	// for response headers (time to first byte) on a single key. A hit rotates
-	// to the next key, then the next provider — it never fails the request on
-	// its own. Bodies stream freely once headers arrive, and there is
-	// deliberately no overall request deadline.
-	//
-	// This has to be built here. NewRouter only falls back to a bounded client
-	// when it is handed a nil one, which happens in tests and nowhere else — so
-	// passing a bare &http.Client{} meant timeout_s had no effect at all in
-	// production and a silent upstream could hang a request indefinitely.
 	ttfb := time.Duration(cfg.GetFallback().TimeoutS) * time.Second
 	client := provider.NewClientWithTTFB(ttfb)
 	log.Printf("per-attempt TTFB timeout: %s (per key; rotates to the next key/provider on expiry)", ttfb)
-	// refresh the models.dev catalog in the background; never block serving.
-	// Run the first fetch immediately on boot (so the gate has remote data
-	// right away instead of waiting a full day), then every 24h.
 	go func() {
 		for {
 			ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
@@ -134,8 +167,6 @@ func serve(args []string) {
 		}
 	}()
 
-	// Periodic event-log pruning so the SQLite database cannot grow without
-	// bound (full request/response bodies are large, especially with media).
 	go func() {
 		ticker := time.NewTicker(24 * time.Hour)
 		defer ticker.Stop()
@@ -151,8 +182,10 @@ func serve(args []string) {
 	r := route.NewRouter(cfg, gate, client)
 	s := server.New(cfg, st, r, gate)
 
-	// SIGHUP: reload config from disk (in-place, no restart) and drop cached
-	// key pickers so any key/provider changes take effect immediately.
+	// Live reload: watch router.yaml and hot-swap on edit. SIGHUP still works.
+	go configWatcher(cfg, r)
+
+	// SIGHUP: reload config from disk (manual fallback; watcher covers edits).
 	go func() {
 		sig := make(chan os.Signal, 1)
 		signal.Notify(sig, syscall.SIGHUP)
@@ -166,8 +199,6 @@ func serve(args []string) {
 		}
 	}()
 
-	// SIGINT/SIGTERM: graceful shutdown — drain in-flight requests and close
-	// the store so pending log writes aren't dropped on restart/deploy.
 	httpSrv := &http.Server{
 		Addr:              cfg.Listen,
 		Handler:           s.Handler(),
@@ -261,15 +292,11 @@ func exampleConfig(args []string) {
 	}
 	cfg.Vision = []string{"agnes:agnes-2.0-flash"}
 
-	// Named chains — explicit fallback sequences that bypass the pool classifier.
-	// Send model="chain:fast" or model="chain:smart" to use them.
 	cfg.Chains = map[string][]string{
 		"fast":     {"openrouter:openai/gpt-5.6-luna", "agnes:agnes-2.0-flash"},
 		"smart":    {"charm:deepseek-v4-flash", "xkiro:minimax/m3"},
 		"cheapest": {"agnes:agnes-2.0-flash"},
 	}
-	// Tier ordering per pool — cheapest first. The router tries the cheapest
-	// tier that can handle the request; 429/5xx escalates to the next tier.
 	cfg.Tiers = map[string][]string{
 		"chat":      {"cheap", "standard"},
 		"code":      {"cheap", "standard"},
@@ -277,14 +304,10 @@ func exampleConfig(args []string) {
 		"reasoning": {"cheap", "standard"},
 	}
 	cfg.AllowDirectVision = true
-	// All known providers pre-seeded with real OpenAI-compatible base URLs.
-	// Keys are nil — the user sets them from the dashboard. A provider with
-	// no keys is passively present: add it to a pool to activate routing.
 	cfg.Providers = config.Providers{
 		OpenRouter: &config.Provider{BaseURL: "https://openrouter.ai/api/v1", Keys: nil},
 		Ollama:     &config.Provider{BaseURL: "http://127.0.0.1:11434", Keys: nil},
 		Custom: map[string]*config.Provider{
-			// key: provider name → real base URL (all OpenAI-compatible)
 			"gh-copilot":     {BaseURL: "https://api.githubcopilot.com", Keys: nil},
 			"google":         {BaseURL: "https://generativelanguage.googleapis.com/v1beta/openai", Keys: nil},
 			"nous":           {BaseURL: "https://api.nousresearch.com/v1", Keys: nil},
