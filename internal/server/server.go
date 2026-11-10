@@ -247,25 +247,29 @@ func (s *Server) handleHealthz(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) authorized(r *http.Request) bool {
-	if s.cfg.RouterKey != "" {
+	// Read the key once: a config reload can replace it mid-check, and
+	// comparing the same credential against two different values would 401 a
+	// correctly keyed client.
+	key := s.cfg.GetRouterKey()
+	if key != "" {
 		h := strings.TrimSpace(r.Header.Get("Authorization"))
 		// Case-insensitive scheme, exact comparison of the secret.
 		h = strings.TrimPrefix(strings.ToLower(h), "bearer ")
-		if h == s.cfg.RouterKey {
+		if h == key {
 			s.clearAuthFailures(r)
 			return true
 		}
 		// Only real attempts count toward the backoff — an absent credential is
 		// usually a misconfigured client probe, not a brute-force try. Constant-
 		// time compare so the equality check itself leaks nothing about the key.
-		if h != "" && subtle.ConstantTimeCompare([]byte(h), []byte(s.cfg.RouterKey)) != 1 {
+		if h != "" && subtle.ConstantTimeCompare([]byte(h), []byte(key)) != 1 {
 			s.noteAuthFailure(r)
 		}
 		return false
 	}
 	// No router key configured: a request is only permitted when the operator
 	// has explicitly opted in. An empty key must NEVER silently open everything.
-	return s.cfg.InsecureNoAuth
+	return s.cfg.GetInsecureNoAuth()
 }
 
 func writeJSON(w http.ResponseWriter, status int, v any) {
@@ -568,12 +572,12 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 	flusher := w.(http.Flusher)
 
 	if streaming {
-		// SSE passthrough: forward each chunk in real time while capturing
-		// the body for the dashboard log. The TeeReader lets us read once
-		// — the bytes flow to the client and accumulate in the buffer
-		// simultaneously.
+		// SSE passthrough: forward each chunk in real time. We cap only the
+		// bytes stored for the dashboard log; the client must receive the
+		// full stream or we'll chop the response mid-generation (no
+		// finish_reason) and clients will think the turn is truncated.
 		var captured bytes.Buffer
-		tee := io.TeeReader(io.LimitReader(res.Resp.Body, maxStoredBody), &captured)
+		tee := io.TeeReader(res.Resp.Body, &limited{w: &captured})
 		buf := make([]byte, 4096)
 		for {
 			n, err := tee.Read(buf)
@@ -653,6 +657,30 @@ func sseUsageTokens(body string) (int, int) {
 		}
 	}
 	return pt, ct
+}
+
+// limited caps how many bytes we actually store for the dashboard log; bytes
+// beyond maxStoredBody still flow to the client but are discarded here instead
+// of being dropped from the stream.
+type limited struct {
+	w     io.Writer
+	total int64
+}
+
+func (l *limited) Write(b []byte) (int, error) {
+	rem := int64(len(b))
+	if l.total+rem > maxStoredBody {
+		rem = maxStoredBody - l.total
+		b = b[:rem]
+	}
+	if rem > 0 {
+		n, err := l.w.Write(b)
+		l.total += int64(n)
+		if err != nil {
+			return n, err
+		}
+	}
+	return len(b), nil
 }
 
 // refSeesImages reports whether one "provider:model" ref can accept pixels.
@@ -755,7 +783,15 @@ func (s *Server) describeImages(ctx context.Context, payload map[string]any, mes
 		}
 		// Bound the vision hop even if the caller's context is open-ended.
 		hopCtx, cancel := context.WithTimeout(ctx, 60*time.Second)
-		resp, err := s.client.Do(hopCtx, &provider.Upstream{Name: pName, BaseURL: up.BaseURL, Keys: up.Keys}, key, hop)
+		// Same wire format and same account-expanded base URL as the main path:
+		// a vision provider configured as gemini or anthropic must not receive
+		// an OpenAI-shaped body just because this hop bypasses the router.
+		resp, err := s.client.Do(hopCtx, &provider.Upstream{
+			Name:    pName,
+			BaseURL: config.ExpandAccountID(up.BaseURL, up.AccountID),
+			Keys:    up.Keys,
+			APIMode: up.APIMode,
+		}, key, hop)
 		cancel()
 		if err != nil {
 			lastErr = fmt.Errorf("vision hop to %s failed: %w", pName, err)
@@ -983,7 +1019,6 @@ type reqDTO struct {
 	FinalModel       string   `json:"final_model"`
 	PromptTokens     int      `json:"prompt_tokens"`
 	CompletionTokens int      `json:"completion_tokens"`
-	Cost             float64  `json:"cost"`
 	TotalMs          int      `json:"total_ms"`
 	ErrorOrigin      string   `json:"error_origin"`
 	RequestBody      string   `json:"request_body,omitempty"`
@@ -992,7 +1027,7 @@ type reqDTO struct {
 }
 
 func toRequestDTO(x store.RequestWithAttempts) reqDTO {
-	d := reqDTO{ID: x.ID, TS: x.TS, Pool: x.Pool, Rule: x.Rule, FinalStatus: x.FinalStatus, FinalProvider: x.FinalProvider, FinalModel: x.FinalModel, PromptTokens: x.PromptTokens, CompletionTokens: x.CompletionTok, Cost: x.Cost, TotalMs: x.TotalMs, ErrorOrigin: x.ErrorOrigin, RequestBody: x.RequestBody, ResponseBody: x.ResponseBody}
+	d := reqDTO{ID: x.ID, TS: x.TS, Pool: x.Pool, Rule: x.Rule, FinalStatus: x.FinalStatus, FinalProvider: x.FinalProvider, FinalModel: x.FinalModel, PromptTokens: x.PromptTokens, CompletionTokens: x.CompletionTok, TotalMs: x.TotalMs, ErrorOrigin: x.ErrorOrigin, RequestBody: x.RequestBody, ResponseBody: x.ResponseBody}
 	for _, a := range x.Attempts {
 		d.Attempts = append(d.Attempts, attDTO{Seq: a.Seq, Provider: a.Provider, Model: a.Model, KeyID: a.KeyID, Status: a.Status, LatencyMs: a.LatencyMs, Err: a.Err, ErrorOrigin: a.ErrorOrigin})
 	}
@@ -1138,7 +1173,7 @@ func (s *Server) handleSetDefault(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusBadRequest, map[string]any{"error": err.Error()})
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"default": s.cfg.Default})
+	writeJSON(w, http.StatusOK, map[string]any{"default": s.cfg.GetDefault()})
 }
 
 func (s *Server) handleSetPool(w http.ResponseWriter, r *http.Request) {
@@ -1147,15 +1182,23 @@ func (s *Server) handleSetPool(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var body struct {
-		Pool    string   `json:"pool"`
-		Entries []string `json:"entries"`
+		Pool        string   `json:"pool"`
+		Entries     []string `json:"entries"`
+		PoolContext *int     `json:"pool_context"`
 	}
-	json.NewDecoder(io.LimitReader(r.Body, 1<<20)).Decode(&body)
-	if err := s.cfg.SetPool(body.Pool, body.Entries); err != nil {
+	if err := json.NewDecoder(io.LimitReader(r.Body, 1<<20)).Decode(&body); err != nil {
 		writeJSON(w, http.StatusBadRequest, map[string]any{"error": err.Error()})
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"pool": body.Pool, "entries": s.cfg.Pools[body.Pool]})
+	if err := s.cfg.SetPoolAndContext(body.Pool, body.Entries, body.PoolContext); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]any{"error": err.Error()})
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"pool":         body.Pool,
+		"entries":      s.cfg.GetPools()[body.Pool],
+		"pool_context": s.cfg.GetPoolContext()[body.Pool],
+	})
 }
 
 func (s *Server) handleSetProvider(w http.ResponseWriter, r *http.Request) {
@@ -1164,13 +1207,12 @@ func (s *Server) handleSetProvider(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var body struct {
-		Name             string                    `json:"name"`
-		BaseURL          string                    `json:"base_url"`
-		AccountID        string                    `json:"account_id"`
-		Keys             []string                  `json:"keys"`
-		APIMode          string                    `json:"api_mode"`
-		Action           string                    `json:"action"`
-		DeploymentLinks  []config.DeploymentLink   `json:"deployment_links"`
+		Name      string   `json:"name"`
+		BaseURL   string   `json:"base_url"`
+		AccountID string   `json:"account_id"`
+		Keys      []string `json:"keys"`
+		APIMode   string   `json:"api_mode"`
+		Action    string   `json:"action"`
 	}
 	if err := json.NewDecoder(io.LimitReader(r.Body, 1<<20)).Decode(&body); err != nil {
 		writeJSON(w, http.StatusBadRequest, map[string]any{"error": err.Error()})
@@ -1186,52 +1228,22 @@ func (s *Server) handleSetProvider(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// If deployment_links are provided, use that path.
-	if len(body.DeploymentLinks) > 0 {
-		if err := s.cfg.SetProviderDeploymentLinks(body.Name, body.DeploymentLinks); err != nil {
-			writeJSON(w, http.StatusBadRequest, map[string]any{"error": err.Error()})
-			return
-		}
-		s.router.InvalidatePicker(body.Name)
-		p, _ := s.cfg.Providers.Get(body.Name)
-		writeJSON(w, http.StatusOK, map[string]any{
-			"name": body.Name,
-			"deployment_links": p.DeploymentLinks,
-			"link_count": len(p.DeploymentLinks),
-		})
-		// async: fetch and cache models from each link
-		if s.store != nil {
-			for i := range p.DeploymentLinks {
-				dl := p.DeploymentLinks[i]
-				go s.fetchAndCacheModels(body.Name, dl.URL, dl.Key)
-			}
-		}
-		return
-	}
-
 	if err := s.cfg.SetProvider(body.Name, body.BaseURL, body.AccountID, body.Keys, body.APIMode); err != nil {
 		writeJSON(w, http.StatusBadRequest, map[string]any{"error": err.Error()})
 		return
 	}
 	s.router.InvalidatePicker(body.Name)
-	p, _ := s.cfg.Providers.Get(body.Name)
+	p, _ := s.cfg.GetProvider(body.Name)
 	writeJSON(w, http.StatusOK, map[string]any{"name": body.Name, "base_url": p.BaseURL, "account_id": p.AccountID, "key_count": len(p.Keys)})
 
 	// async: fetch and cache models from the upstream so the dashboard has
 	// them ready without the user manually clicking "Fetch Models"
-	if s.store != nil {
-		if p.HasDeploymentLinks() {
-			for i := range p.DeploymentLinks {
-				dl := p.DeploymentLinks[i]
-				go s.fetchAndCacheModels(body.Name, dl.URL, dl.Key)
-			}
-		} else if p.BaseURL != "" {
-			key := ""
-			if len(p.Keys) > 0 {
-				key = p.Keys[0]
-			}
-			go s.fetchAndCacheModels(body.Name, p.BaseURL, key)
+	if s.store != nil && p.BaseURL != "" {
+		key := ""
+		if len(p.Keys) > 0 {
+			key = p.Keys[0]
 		}
+		go s.fetchAndCacheModels(body.Name, p.BaseURL, key)
 	}
 }
 
@@ -1294,23 +1306,16 @@ func (s *Server) handleSetKeys(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	s.router.InvalidatePicker(body.Name)
-	p, _ := s.cfg.Providers.Get(body.Name)
+	p, _ := s.cfg.GetProvider(body.Name)
 	writeJSON(w, http.StatusOK, map[string]any{"name": body.Name, "key_count": len(p.Keys), "key_labels": p.KeyLabels})
 
 	// async: fetch and cache models now that keys are set
-	if s.store != nil {
-		if p.HasDeploymentLinks() {
-			for i := range p.DeploymentLinks {
-				dl := p.DeploymentLinks[i]
-				go s.fetchAndCacheModels(body.Name, dl.URL, dl.Key)
-			}
-		} else if p.BaseURL != "" {
-			key := ""
-			if len(p.Keys) > 0 {
-				key = p.Keys[0]
-			}
-			go s.fetchAndCacheModels(body.Name, p.BaseURL, key)
+	if s.store != nil && p.BaseURL != "" {
+		key := ""
+		if len(p.Keys) > 0 {
+			key = p.Keys[0]
 		}
+		go s.fetchAndCacheModels(body.Name, p.BaseURL, key)
 	}
 }
 
@@ -1376,7 +1381,8 @@ func (s *Server) handleSetChain(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusBadRequest, map[string]any{"error": err.Error()})
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"chain": body.Name, "entries": s.cfg.Chains[body.Name]})
+	entries, _ := s.cfg.GetChain(body.Name)
+	writeJSON(w, http.StatusOK, map[string]any{"chain": body.Name, "entries": entries})
 }
 
 func (s *Server) handleRemoveChain(w http.ResponseWriter, r *http.Request) {
@@ -1415,7 +1421,7 @@ func (s *Server) handleSetTier(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusBadRequest, map[string]any{"error": err.Error()})
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"pool": body.Pool, "tiers": s.cfg.Tiers[body.Pool]})
+	writeJSON(w, http.StatusOK, map[string]any{"pool": body.Pool, "tiers": s.cfg.GetTiers(body.Pool)})
 }
 
 // handleLogo serves embedded provider logo images from /logos/{name}.png.
@@ -1450,12 +1456,8 @@ func (s *Server) handleLogo(w http.ResponseWriter, r *http.Request) {
 
 // resolveProviderURL builds the /v1/models URL and resolves the API key for a
 // provider strictly from the configured values. It deliberately ignores any
-// caller-supplied ?base_url=/?key=/?link_hash= query params: allowing those
-// would turn the admin API into an SSRF proxy to arbitrary internal/metadata
-// endpoints.
-//
-// For providers with deployment links, the caller may pass ?link_hash= to
-// select a specific link. If no hash is given, the first link is used.
+// caller-supplied ?base_url=/?key= query params: allowing those would turn
+// the admin API into an SSRF proxy to arbitrary internal/metadata endpoints.
 func (s *Server) resolveProviderURL(r *http.Request) (modelsURL, key string, errStatus int, err error) {
 	name := r.PathValue("name")
 	p, ok := s.cfg.GetProvider(name)
@@ -1463,36 +1465,10 @@ func (s *Server) resolveProviderURL(r *http.Request) (modelsURL, key string, err
 		return "", "", http.StatusNotFound, fmt.Errorf("provider not found")
 	}
 
-	// Deployment-links provider: pick the right link.
-	if p.HasDeploymentLinks() {
-		linkHash := r.URL.Query().Get("link_hash")
-		var selected *config.DeploymentLink
-		for i := range p.DeploymentLinks {
-			dl := &p.DeploymentLinks[i]
-			if linkHash == "" || dl.ShortHash() == linkHash {
-				selected = dl
-				break
-			}
-		}
-		if selected == nil {
-			// linkHash didn't match any link — fall back to first
-			selected = &p.DeploymentLinks[0]
-		}
-		u := strings.TrimRight(selected.URL, "/")
-		if !strings.HasSuffix(u, "/v1") {
-			u += "/v1"
-		}
-		return u + "/models", selected.Key, 0, nil
-	}
-
-	baseURL := p.BaseURL
-	accountID := p.AccountID
+	baseURL := config.ExpandAccountID(p.BaseURL, p.AccountID)
 	key = ""
 	if len(p.Keys) > 0 {
 		key = p.Keys[0]
-	}
-	if accountID != "" {
-		baseURL = strings.ReplaceAll(baseURL, "{account_id}", accountID)
 	}
 	u := strings.TrimRight(baseURL, "/")
 	if strings.HasSuffix(u, "/v1") {
@@ -1511,58 +1487,20 @@ func (s *Server) resolveProviderURL(r *http.Request) (modelsURL, key string, err
 // dashboard doesn't need to re-fetch every time the provider panel is opened.
 // It uses the provider's configured base_url and key only (no caller overrides).
 //
-// For providers with deployment links, it fetches /v1/models from EACH link
-// and aggregates the results — each link serves exactly one model.
+// The router's manually-added models (store rows with source "custom") live
+// only in the store: no upstream /v1/models lists them. They are merged into
+// the response here, otherwise the playground's model dropdown — which is fed
+// by this endpoint — hides exactly the models the operator added by hand.
 func (s *Server) handleProviderModels(w http.ResponseWriter, r *http.Request) {
 	if !s.authorized(r) {
 		writeJSON(w, http.StatusUnauthorized, map[string]any{"error": map[string]string{"message": "unauthorized"}})
 		return
 	}
 	name := r.PathValue("name")
-	p, ok := s.cfg.GetProvider(name)
-	if !ok {
+	if _, ok := s.cfg.GetProvider(name); !ok {
 		writeJSON(w, http.StatusNotFound, map[string]any{"error": "provider not found"})
 		return
 	}
-
-	// For deployment-links providers, fetch from all links and aggregate.
-	if p.HasDeploymentLinks() {
-		allModels := []map[string]any{}
-		anySuccess := false
-		for i := range p.DeploymentLinks {
-			dl := &p.DeploymentLinks[i]
-			models, err := s.fetchModelsFromURL(dl.URL, dl.Key)
-			if err != nil {
-				log.Printf("handleProviderModels %s link %s: %v", name, dl.ShortHash(), err)
-				continue
-			}
-			for _, m := range models {
-				m["link_hash"] = dl.ShortHash()
-				allModels = append(allModels, m)
-			}
-			anySuccess = true
-		}
-		if !anySuccess {
-			// fall back to cache
-			if s.store != nil {
-				cached, cerr := s.store.GetProviderModels(name)
-				if cerr == nil && len(cached) > 0 {
-					models := make([]map[string]any, 0, len(cached))
-					for _, m := range cached {
-						models = append(models, map[string]any{"id": m.ModelID, "object": "model", "source": m.Source})
-					}
-					writeJSON(w, http.StatusOK, map[string]any{"data": models, "cached": true})
-					return
-				}
-			}
-			writeJSON(w, http.StatusBadGateway, map[string]any{"error": "all deployment links failed"})
-			return
-		}
-		writeJSON(w, http.StatusOK, map[string]any{"data": allModels})
-		return
-	}
-
-	// Single-endpoint provider — original behavior.
 
 	modelsURL, key, errStatus, err := s.resolveProviderURL(r)
 	if err != nil {
@@ -1601,30 +1539,15 @@ func (s *Server) handleProviderModels(w http.ResponseWriter, r *http.Request) {
 	// read and cache the models if the fetch was successful
 	bodyBytes, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
 	if resp.StatusCode == 200 && s.store != nil {
-		var data struct {
-			Data []struct {
-				ID string `json:"id"`
-			} `json:"data"`
-			Models []struct {
-				ID string `json:"id"`
-			} `json:"models"`
+		if ids, ok := modelIDsFromList(bodyBytes); ok && len(ids) > 0 {
+			s.store.SetProviderModels(name, ids)
 		}
-		if json.Unmarshal(bodyBytes, &data) == nil {
-			var ids []string
-			for _, m := range data.Data {
-				if m.ID != "" {
-					ids = append(ids, m.ID)
-				}
-			}
-			for _, m := range data.Models {
-				if m.ID != "" {
-					ids = append(ids, m.ID)
-				}
-			}
-			if len(ids) > 0 {
-				s.store.SetProviderModels(name, ids)
-			}
-		}
+	}
+
+	// A successful upstream list gets the provider's custom models merged in.
+	// Error payloads have no model list, so they pass through untouched.
+	if resp.StatusCode == 200 {
+		bodyBytes = mergeCustomModelsJSON(bodyBytes, s.customModelIDs(name))
 	}
 
 	w.Header().Set("Content-Type", "application/json")
@@ -1632,33 +1555,99 @@ func (s *Server) handleProviderModels(w http.ResponseWriter, r *http.Request) {
 	w.Write(bodyBytes)
 }
 
-// fetchModelsFromURL fetches /v1/models from a single URL and returns the
-// model list. Used for deployment-links providers where each URL serves
-// exactly one model.
-func (s *Server) fetchModelsFromURL(baseURL, key string) ([]map[string]any, error) {
-	base := strings.TrimSuffix(baseURL, "/")
-	if !strings.HasSuffix(base, "/v1") {
-		base += "/v1"
+// customModelIDs returns a provider's manually-added model ids (store rows with
+// source "custom"). Empty whenever the store is absent or unreadable — callers
+// treat that as "nothing to merge".
+func (s *Server) customModelIDs(provider string) []string {
+	if s.store == nil {
+		return nil
 	}
-	req, err := http.NewRequest("GET", base+"/models", nil)
+	cached, err := s.store.GetProviderModels(provider)
 	if err != nil {
-		return nil, err
+		return nil
 	}
-	req.Header.Set("User-Agent", "llm-router/1.0 (Mozilla/5.0 compatible)")
-	if key != "" {
-		req.Header.Set("Authorization", "Bearer "+key)
+	var out []string
+	for _, m := range cached {
+		if m.Source == "custom" {
+			out = append(out, m.ModelID)
+		}
 	}
-	client := &http.Client{Timeout: 15 * time.Second}
-	resp, err := client.Do(req)
+	return out
+}
+
+// appendCustomModels adds custom model ids to an already-decoded /v1/models
+// list, skipping ids the upstream reported itself so nothing is duplicated.
+func appendCustomModels(list []map[string]any, custom []string) []map[string]any {
+	if len(custom) == 0 {
+		return list
+	}
+	have := make(map[string]bool, len(list))
+	for _, m := range list {
+		if id, _ := m["id"].(string); id != "" {
+			have[id] = true
+		}
+	}
+	for _, id := range custom {
+		if have[id] {
+			continue
+		}
+		list = append(list, map[string]any{"id": id, "object": "model", "source": "custom"})
+	}
+	return list
+}
+
+// mergeCustomModelsJSON injects custom model ids into a raw /v1/models payload,
+// for the single-endpoint path that proxies upstream bytes verbatim. OpenAI
+// style lists live under "data", some upstreams use "models", and the
+// dashboard reads either — so whichever key is present gets the merge. Anything
+// that does not parse into a model list is returned untouched: a cosmetic merge
+// must never break the passthrough.
+func mergeCustomModelsJSON(body []byte, custom []string) []byte {
+	if len(custom) == 0 {
+		return body
+	}
+	var payload map[string]json.RawMessage
+	if err := json.Unmarshal(body, &payload); err != nil {
+		return body
+	}
+	changed := false
+	for _, key := range []string{"data", "models"} {
+		raw, ok := payload[key]
+		if !ok {
+			continue
+		}
+		var list []map[string]any
+		if err := json.Unmarshal(raw, &list); err != nil {
+			continue
+		}
+		merged := appendCustomModels(list, custom)
+		if len(merged) == len(list) {
+			continue
+		}
+		encoded, err := json.Marshal(merged)
+		if err != nil {
+			continue
+		}
+		payload[key] = encoded
+		changed = true
+	}
+	if !changed {
+		return body
+	}
+	out, err := json.Marshal(payload)
 	if err != nil {
-		return nil, err
+		return body
 	}
-	defer resp.Body.Close()
-	if resp.StatusCode != 200 {
-		return nil, fmt.Errorf("HTTP %d", resp.StatusCode)
-	}
-	bodyBytes, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
-	var data struct {
+	return out
+}
+
+// modelIDsFromList pulls the model ids out of a /v1/models payload. Both
+// shapes are in the wild: OpenAI's {"data":[{"id":...}]} and the {"models":
+// [...]} form some gateways use. ok is false when the body does not decode as
+// a list at all, which is how an upstream error payload is told apart from a
+// list that simply came back empty.
+func modelIDsFromList(body []byte) (ids []string, ok bool) {
+	var payload struct {
 		Data []struct {
 			ID string `json:"id"`
 		} `json:"data"`
@@ -1666,21 +1655,20 @@ func (s *Server) fetchModelsFromURL(baseURL, key string) ([]map[string]any, erro
 			ID string `json:"id"`
 		} `json:"models"`
 	}
-	if json.Unmarshal(bodyBytes, &data) != nil {
-		return nil, fmt.Errorf("invalid JSON from /models")
+	if err := json.Unmarshal(body, &payload); err != nil {
+		return nil, false
 	}
-	var out []map[string]any
-	for _, m := range data.Data {
+	for _, m := range payload.Data {
 		if m.ID != "" {
-			out = append(out, map[string]any{"id": m.ID, "object": "model", "source": "fetched"})
+			ids = append(ids, m.ID)
 		}
 	}
-	for _, m := range data.Models {
+	for _, m := range payload.Models {
 		if m.ID != "" {
-			out = append(out, map[string]any{"id": m.ID, "object": "model", "source": "fetched"})
+			ids = append(ids, m.ID)
 		}
 	}
-	return out, nil
+	return ids, true
 }
 
 // handleGetCachedModels returns the stored model cache for a provider without
@@ -1732,7 +1720,7 @@ func (s *Server) handleAddCustomModel(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusBadRequest, map[string]any{"error": "model_id too long (max 256 chars)"})
 		return
 	}
-	if _, ok := s.cfg.Providers.Get(name); !ok {
+	if _, ok := s.cfg.GetProvider(name); !ok {
 		writeJSON(w, http.StatusNotFound, map[string]any{"error": "provider not found"})
 		return
 	}
@@ -1811,33 +1799,16 @@ func (s *Server) fetchAndCacheModels(name string, baseURL string, key string) {
 		return
 	}
 	bodyBytes, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
-	var data struct {
-		Data []struct {
-			ID string `json:"id"`
-		} `json:"data"`
-		Models []struct {
-			ID string `json:"id"`
-		} `json:"models"`
-	}
-	if json.Unmarshal(bodyBytes, &data) != nil {
+	ids, ok := modelIDsFromList(bodyBytes)
+	if !ok {
 		log.Printf("fetchAndCacheModels %s: invalid JSON from /models", name)
 		return
 	}
-	var ids []string
-	for _, m := range data.Data {
-		if m.ID != "" {
-			ids = append(ids, m.ID)
-		}
+	if len(ids) == 0 {
+		return
 	}
-	for _, m := range data.Models {
-		if m.ID != "" {
-			ids = append(ids, m.ID)
-		}
-	}
-	if len(ids) > 0 {
-		if err := s.store.SetProviderModels(name, ids); err != nil {
-			log.Printf("fetchAndCacheModels %s: SetProviderModels: %v", name, err)
-		}
+	if err := s.store.SetProviderModels(name, ids); err != nil {
+		log.Printf("fetchAndCacheModels %s: SetProviderModels: %v", name, err)
 	}
 }
 
